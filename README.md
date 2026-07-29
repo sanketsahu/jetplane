@@ -150,3 +150,18 @@ deletion handling in HMR, shared-service HMR transforms, the 0.2% worklet
 path-normalization gap, app-layer cache-vary for env, and a first-class `jetplane serve`.
 
 Contributions welcome. Not affiliated with or endorsed by Meta, Expo, or the React Native team.
+
+## Related projects
+
+jetplane is built by the team behind **[RapidNative](https://rapidnative.com)** — AI that
+generates production-ready React Native apps and UIs from a prompt — alongside these
+open-source tools:
+
+| Project | What it is |
+| --- | --- |
+| [RapidNative](https://rapidnative.com) | AI that generates production-ready React Native apps and UIs from a prompt |
+| [tinbase](https://tinbase.dev) | A Supabase-compatible backend without Docker — one process, real Postgres, runs in the browser |
+| [Lifo](https://lifo.sh) | Linux APIs in the browser — real dev tooling with no VM and no container |
+| [ORCHD](https://rapidnative.github.io/orchd) | A multi-tenant workload orchestrator — per-tenant workloads that sleep when idle and wake on the next request |
+
+See them all on [rapidnative.com/open-source](https://www.rapidnative.com/open-source).
