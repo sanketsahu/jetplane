@@ -11,6 +11,7 @@ const asset = (p: string) => (p.startsWith('/') ? BASE_PATH + p : p)
 const RELATED = [
   { name: 'Lifo', href: 'https://lifo.sh', logo: 'https://lifo.sh/brand/lifo-logo.svg', desc: 'Linux APIs in the browser — run real dev tooling with no VM, no container.' },
   { name: 'tinbase', href: 'https://tinbase.dev', logo: 'https://tinbase.dev/logo.svg', desc: 'An open-source, Supabase-compatible backend that runs anywhere — pure TypeScript, Postgres in the browser.' },
+  { name: 'ORCHD', href: 'https://rapidnative.github.io/orchd', logo: 'https://rapidnative.github.io/orchd/logo.svg', desc: 'A multi-tenant workload orchestrator — every tenant gets a hostname, sleeps when idle, wakes in about a second.' },
   { name: 'RapidNative', href: 'https://rapidnative.com', logo: '/logos/rapidnative.svg', desc: 'AI that generates production-ready React Native apps and UIs from a prompt.' },
 ]
 
@@ -40,7 +41,7 @@ export function SiteFooter() {
           <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
             jetplane is built by the makers of these open-source tools and products.
           </p>
-          <div className="mt-6 grid gap-3 sm:grid-cols-3">
+          <div className="mt-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             {RELATED.map((p) => (
               <a
                 key={p.name}
