@@ -180,9 +180,17 @@ function bundleFailure(res) {
 
 // 3. build the device-bootable bundle by capturing it from Metro once (cached per project +
 // app source via imageKey — NOT per lockfile, which would collide across same-dep projects)
-async function ensureBundle(dir, platform = 'ios') {
+// Every native platform is captured separately. A bundle is platform-specific — module ids
+// and native module registrations differ — so serving the iOS bundle to an Android client
+// (which is what a single-platform image forced) cannot work.
+const NATIVE_PLATFORMS = ['ios', 'android']
+
+async function ensureBundle(dir) {
   const imageDir = path.join(HOME, '.jetplane', 'images', imageKey(dir))
-  const complete = ['main.ios.bundle', 'manifest-multipart.bin', 'index.html', 'main.web.bundle']
+  const complete = [
+    ...NATIVE_PLATFORMS.flatMap((p) => [`main.${p}.bundle`, `manifest-multipart.${p}.bin`, `manifest.${p}.json`]),
+    'index.html', 'main.web.bundle',
+  ]
   if (complete.every((f) => fs.existsSync(path.join(imageDir, f)))) {
     log(`bundle cached (${path.relative(HOME, imageDir)})`); return imageDir
   }
@@ -229,16 +237,19 @@ async function ensureBundle(dir, platform = 'ios') {
   }
   const kill = () => { try { process.kill(-metro.pid, 'SIGKILL') } catch {} }
   try {
-    const json = (await get(base, 20000, { 'expo-platform': platform, Accept: 'application/expo+json,application/json' })).body
-    fs.writeFileSync(path.join(imageDir, 'manifest.json'), json)
-    const multi = (await get(base, 20000, { 'expo-platform': platform, 'expo-protocol-version': '1', Accept: 'multipart/mixed,application/expo+json,application/json' })).body
-    fs.writeFileSync(path.join(imageDir, 'manifest-multipart.bin'), multi)
-    const url = JSON.parse(json).launchAsset.url
-    log('bundling (first build may take a moment)...')
-    const bundle = await get(url, 180000)
-    if (!bundle.ok) throw new Error(bundleFailure(bundle))
-    fs.writeFileSync(path.join(imageDir, `main.${platform}.bundle`), bundle.body)
-    log(`native bundle built -> ${path.relative(HOME, imageDir)}`)
+    for (const platform of NATIVE_PLATFORMS) {
+      const json = (await get(base, 20000, { 'expo-platform': platform, Accept: 'application/expo+json,application/json' })).body
+      fs.writeFileSync(path.join(imageDir, `manifest.${platform}.json`), json)
+      const multi = (await get(base, 20000, { 'expo-platform': platform, 'expo-protocol-version': '1', Accept: 'multipart/mixed,application/expo+json,application/json' })).body
+      fs.writeFileSync(path.join(imageDir, `manifest-multipart.${platform}.bin`), multi)
+      let url
+      try { url = JSON.parse(json).launchAsset.url } catch { throw new Error(`could not read the ${platform} manifest from Metro:\n${json.slice(0, 500)}`) }
+      log(`bundling ${platform} (first build may take a moment)...`)
+      const bundle = await get(url, 180000)
+      if (!bundle.ok) throw new Error(`[${platform}] ${bundleFailure(bundle)}`)
+      fs.writeFileSync(path.join(imageDir, `main.${platform}.bundle`), bundle.body)
+      log(`${platform} bundle built (${(bundle.body.length / 1048576).toFixed(1)} MB)`)
+    }
 
     // web: capture the HTML shell + a self-contained (lazy=false) web bundle, so the
     // thin server can serve the browser target the same way it serves the device.

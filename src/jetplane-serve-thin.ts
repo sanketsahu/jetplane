@@ -31,14 +31,46 @@ function lanIP(): string {
   return 'localhost'
 }
 
-const manifestRaw = fs.readFileSync(path.join(imageDir, 'manifest.json'), 'utf8')
-// Expo Go (dev) requests multipart/mixed and rejects plain JSON as a "legacy manifest".
-// We replay the exact multipart response captured from Expo's own dev server.
-const multipartPath = path.join(imageDir, 'manifest-multipart.bin')
-const multipartRaw = fs.existsSync(multipartPath) ? fs.readFileSync(multipartPath, 'utf8') : ''
-const boundary = multipartRaw ? multipartRaw.split('\r\n')[0].replace(/^--/, '') : ''
-const bundlePath = path.join(imageDir, 'main.ios.bundle')
-const bundle = (globalThis as any).Bun.mmap(bundlePath) as Uint8Array
+// One target per native platform. Bundles are platform-specific (module ids and native
+// module registrations differ), so each platform gets its own manifest + bundle + HMR maps
+// and a request is answered from the target it actually asked for.
+type Target = { manifestRaw: string; multipartRaw: string; boundary: string; bundle: Uint8Array; maps: any }
+
+const NATIVE_PLATFORMS = ['ios', 'android'] as const
+const targets = new Map<string, Target>()
+
+for (const p of NATIVE_PLATFORMS) {
+  const bundlePath = path.join(imageDir, `main.${p}.bundle`)
+  const manifestPath = path.join(imageDir, `manifest.${p}.json`)
+  if (!fs.existsSync(bundlePath) || !fs.existsSync(manifestPath)) continue
+  // Expo Go (dev) requests multipart/mixed and rejects plain JSON as a "legacy manifest".
+  // We replay the exact multipart response captured from Expo's own dev server.
+  const multipartPath = path.join(imageDir, `manifest-multipart.${p}.bin`)
+  const multipartRaw = fs.existsSync(multipartPath) ? fs.readFileSync(multipartPath, 'utf8') : ''
+  targets.set(p, {
+    manifestRaw: fs.readFileSync(manifestPath, 'utf8'),
+    multipartRaw,
+    boundary: multipartRaw ? multipartRaw.split('\r\n')[0].replace(/^--/, '') : '',
+    bundle: (globalThis as any).Bun.mmap(bundlePath) as Uint8Array,
+    maps: parseBundle(bundlePath),
+  })
+}
+
+if (targets.size === 0) {
+  console.error(`jetplane: no native bundle found in ${imageDir}. Delete it and re-run to rebuild.`)
+  process.exit(1)
+}
+
+// Which target a request is for. Expo Go sends expo-platform; bundle/asset URLs carry
+// ?platform=. Falling back to a *present* platform is only for odd clients that send
+// neither — never a substitute for an absent one.
+function platformOf(req: Request, url: URL): string {
+  return (
+    req.headers.get('expo-platform') ||
+    url.searchParams.get('platform') ||
+    (targets.has('ios') ? 'ios' : [...targets.keys()][0])
+  )
+}
 
 // web target (optional): an HTML shell + a self-contained web bundle captured alongside
 // the native one. The browser loads the shell, which pulls /jetplane-web.bundle and
@@ -49,8 +81,7 @@ const hasWeb = fs.existsSync(webHtmlPath) && fs.existsSync(webBundlePath)
 const webHtml = hasWeb ? fs.readFileSync(webHtmlPath, 'utf8') : ''
 const webBundle = hasWeb ? ((globalThis as any).Bun.mmap(webBundlePath) as Uint8Array) : null
 
-// HMR: parse each bundle for path->id/deps/inverse-deps, watch app files, push updates
-const maps = parseBundle(bundlePath)
+// HMR: each target's maps come from its own bundle (parsed above); web has its own too.
 const webMaps = hasWeb ? parseBundle(webBundlePath) : null
 const clients = new Set<any>()
 const clientPlatform = new Map<any, string>() // ws -> 'ios' | 'android' | 'web'
@@ -66,7 +97,7 @@ async function pushUpdate(absFile: string) {
     ;(groups.get(p) ?? groups.set(p, []).get(p)!).push(ws)
   }
   for (const [platform, wss] of groups) {
-    const m = platform === 'web' ? webMaps : maps
+    const m = platform === 'web' ? webMaps : targets.get(platform)?.maps
     if (!m) continue
     try {
       const { modified, added } = await makeUpdate(projectDir, absFile, m, publicOrigin(), platform)
@@ -166,8 +197,18 @@ const serveOpts = {
       }
     }
 
+    // Everything below is platform-specific. An unknown platform is an error, not a
+    // silent fallback to another platform's bundle — that boots to a broken app.
+    const platform = platformOf(req, url)
+    const target = targets.get(platform)
+    if (!target) {
+      const msg = `jetplane: no ${platform} bundle in this image (have: ${[...targets.keys()].join(', ')}). Delete ~/.jetplane/images and re-run to rebuild.`
+      console.log(msg)
+      return new Response(msg, { status: 404 })
+    }
+
     if (url.pathname.endsWith('.bundle')) {
-      return new Response(bundle, { headers: { 'content-type': 'application/javascript', 'x-jetplane-rss-mb': rssMB() } })
+      return new Response(target.bundle, { headers: { 'content-type': 'application/javascript', 'x-jetplane-platform': platform, 'x-jetplane-rss-mb': rssMB() } })
     }
 
     if (url.pathname.startsWith('/assets')) return serveAsset(url)
@@ -175,17 +216,18 @@ const serveOpts = {
     // manifest: rewrite the captured host to whatever the client reached us on, so the
     // bundle + asset URLs point back here (works for simulator localhost and LAN phone)
     const accept = req.headers.get('accept') || ''
-    if (accept.includes('multipart/mixed') && multipartRaw) {
-      return new Response(rewriteHost(freshen(multipartRaw), origin), {
+    if (accept.includes('multipart/mixed') && target.multipartRaw) {
+      return new Response(rewriteHost(freshen(target.multipartRaw), origin), {
         headers: {
-          'content-type': `multipart/mixed; boundary=${boundary}`,
+          'content-type': `multipart/mixed; boundary=${target.boundary}`,
           'expo-protocol-version': '0',
           'expo-sfv-version': '0',
+          'x-jetplane-platform': platform,
           'cache-control': 'private, max-age=0',
         },
       })
     }
-    return new Response(rewriteHost(freshen(manifestRaw), origin), { headers: { 'content-type': 'application/expo+json', 'cache-control': 'private, max-age=0' } })
+    return new Response(rewriteHost(freshen(target.manifestRaw), origin), { headers: { 'content-type': 'application/expo+json', 'x-jetplane-platform': platform, 'cache-control': 'private, max-age=0' } })
   },
   websocket: {
     open(ws: any) { clients.add(ws) },
@@ -236,7 +278,8 @@ for (let attempt = 0; ; attempt++) {
 }
 port = server.port
 
-console.log(`jetplane-serve-thin: :${port}  bundle=${(bundle.length / 1048576).toFixed(1)}MB mmap'd  idleRSS=${rssMB()}MB (no Metro)`)
+const sizes = [...targets].map(([p, t]) => `${p}=${(t.bundle.length / 1048576).toFixed(1)}MB`).join(' ')
+console.log(`jetplane-serve-thin: :${port}  ${sizes} mmap'd  idleRSS=${rssMB()}MB (no Metro)`)
 if (ENV_ORIGIN || ENV_HOST) {
   console.log(`jetplane: advertising public origin ${publicOrigin()}` +
     (ENV_ORIGIN ? ' (EXPO_DEV_SERVER_ORIGIN)' : ` (REACT_NATIVE_PACKAGER_HOSTNAME; scheme from X-Forwarded-Proto or http)`))
