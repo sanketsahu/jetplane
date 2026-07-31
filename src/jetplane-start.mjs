@@ -15,6 +15,7 @@ import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const HOME = os.homedir()
@@ -118,10 +119,63 @@ function imageKey(dir) {
   return h.digest('hex').slice(0, 16)
 }
 
+// The wiring we write into metro.config.js is `require.resolve('jetplane/transformer')`,
+// which Metro resolves from the PROJECT root. Running the CLI through `npx` doesn't put
+// jetplane there — it lives in npx's cache — so Metro dies on an unresolvable require
+// before it ever serves. Catch that here, where we can say so, instead of letting it
+// surface as an opaque 'Metro did not start'.
+function ensureResolvable(dir) {
+  const cfg = path.join(dir, 'metro.config.js')
+  if (!fs.existsSync(cfg)) return
+  if (!fs.readFileSync(cfg, 'utf8').includes('jetplane/transformer')) return
+  try {
+    createRequire(path.join(dir, 'package.json')).resolve('jetplane/transformer')
+  } catch {
+    throw new Error(
+      `metro.config.js requires 'jetplane/transformer', but jetplane is not installed in this project.\n\n` +
+      `Metro resolves the transformer from the project root, so running the CLI via npx is not enough —\n` +
+      `jetplane has to be a dependency here:\n\n  npm install -D jetplane\n\n` +
+      `(then re-run; the CLI itself can still be invoked with npx.)`
+    )
+  }
+}
+
+// Prefer the project's own expo binary over `npx expo`. `npx` inside an npx-run CLI can
+// resolve against the wrong root (or go to the network), and it hides a missing dep behind
+// an install attempt instead of a clear error.
+function expoCommand(dir) {
+  const local = path.join(dir, 'node_modules', '.bin', process.platform === 'win32' ? 'expo.cmd' : 'expo')
+  return fs.existsSync(local) ? [local, []] : ['npx', ['expo']]
+}
+
+function metroFailure(label, isNpx, out) {
+  const tail = out.slice(-25).join('\n')
+  const hint = isNpx
+    ? `\n\nNo local expo binary was found in node_modules/.bin — is 'expo' a dependency of this project, and are deps installed?`
+    : ''
+  return `Metro did not start (temporary build server).\n\n--- output from '${label}' ---\n${tail || '(no output)'}\n--- end of output ---${hint}`
+}
+
 async function get(url, ms, headers = {}) {
   const c = new AbortController(); const t = setTimeout(() => c.abort(), ms)
-  try { const r = await fetch(url, { signal: c.signal, headers }); return { ok: r.ok, body: await r.text() } }
-  catch { return { ok: false, body: '' } } finally { clearTimeout(t) }
+  try { const r = await fetch(url, { signal: c.signal, headers }); return { ok: r.ok, status: r.status, body: await r.text() } }
+  catch (e) { return { ok: false, status: 0, body: '', error: e?.name === 'AbortError' ? `timed out after ${ms}ms` : e.message } }
+  finally { clearTimeout(t) }
+}
+
+// Metro answers a failed bundle with a JSON error body (TransformError, resolution
+// failures, …). That body names the file and line — surface it instead of collapsing
+// every cause into 'bundle request failed'.
+function bundleFailure(res) {
+  if (res.error) return `bundle request failed (${res.error})`
+  let detail = res.body?.slice(0, 2000) || '(empty response)'
+  try {
+    const j = JSON.parse(res.body)
+    // strip the ANSI-art code frame; the message + location is the useful part
+    const where = j.filename ? ` in ${j.filename}${j.lineNumber ? `:${j.lineNumber}` : ''}` : ''
+    if (j.message) detail = `${j.type || j.name || 'Error'}${where}\n${String(j.message).split('\n')[0]}`
+  } catch {}
+  return `bundle request failed (HTTP ${res.status})\n\n--- Metro said ---\n${detail}\n--- end ---`
 }
 
 // 3. build the device-bootable bundle by capturing it from Metro once (cached per project +
@@ -141,19 +195,35 @@ async function ensureBundle(dir, platform = 'ios') {
   let metro, port, base
   for (let attempt = 1; ; attempt++) {
     port = await freePort()
-    metro = spawn('npx', ['expo', 'start', '--port', String(port)], { cwd: dir, env: { ...process.env, CI: '1' }, detached: true, stdio: 'ignore' })
+    const [cmd, pre] = expoCommand(dir)
+    const label = [cmd === 'npx' ? 'npx' : path.relative(dir, cmd), ...pre, 'start'].join(' ')
+    // Keep Metro's output instead of discarding it: when the build server fails to come
+    // up, its stderr is the only thing that says why, and 'Metro did not start' on its
+    // own is undiagnosable.
+    metro = spawn(cmd, [...pre, 'start', '--port', String(port)], { cwd: dir, env: { ...process.env, CI: '1' }, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    const out = []
+    const collect = (b) => { for (const l of String(b).split('\n')) if (l.trim()) { out.push(l); if (out.length > 60) out.shift() } }
+    metro.stdout.on('data', collect)
+    metro.stderr.on('data', collect)
+    metro.on('error', (e) => collect(`spawn ${cmd}: ${e.message}`))
+
     base = `http://localhost:${port}/`
     const dl = Date.now() + 180000
-    let up = false
+    let up = false, died = false
     while (Date.now() < dl) {
-      if (metro.exitCode != null) break // metro died (port taken / start failed)
+      if (metro.exitCode != null || metro.signalCode != null) { died = true; break }
       const r = await get(base + 'status', 2000)
       if (r.ok && r.body.includes('running')) { up = true; break }
       await sleep(500)
     }
     if (up) break
     try { process.kill(-metro.pid, 'SIGKILL') } catch {}
-    if (attempt >= 3) throw new Error('Metro did not start (temporary build server)')
+
+    // Retrying only helps for a port race. If Metro exited on its own and never mentioned
+    // the port, a fresh port will fail identically — report the real output now.
+    const portRace = out.some((l) => /EADDRINUSE|address already in use|port \d+ is (?:already )?(?:in use|running)/i.test(l))
+    if (died && !portRace) throw new Error(metroFailure(label, cmd === 'npx', out))
+    if (attempt >= 3) throw new Error(metroFailure(label, cmd === 'npx', out))
     log(`build server didn't come up on :${port} — retrying on a fresh port...`)
     await sleep(500)
   }
@@ -166,7 +236,7 @@ async function ensureBundle(dir, platform = 'ios') {
     const url = JSON.parse(json).launchAsset.url
     log('bundling (first build may take a moment)...')
     const bundle = await get(url, 180000)
-    if (!bundle.ok) throw new Error('bundle request failed')
+    if (!bundle.ok) throw new Error(bundleFailure(bundle))
     fs.writeFileSync(path.join(imageDir, `main.${platform}.bundle`), bundle.body)
     log(`native bundle built -> ${path.relative(HOME, imageDir)}`)
 
@@ -194,27 +264,32 @@ async function ensureBundle(dir, platform = 'ios') {
 }
 
 // 4. serve it from the thin server (Bun)
-function serveThin(dir, port, imageDir) {
+function serveThin(dir, port, imageDir, explicitPort = false) {
   if (!has('bun')) { console.error('jetplane: the thin server needs Bun — install it from https://bun.sh, then re-run.'); process.exit(1) }
   const thin = path.join(HERE, 'jetplane-serve-thin.ts')
-  const child = spawn('bun', [thin, dir, String(port), imageDir], { stdio: 'inherit' })
+  // A port the user asked for is strict — see the CLI note. Only an unrequested default
+  // is allowed to drift to the next free port.
+  const env = { ...process.env, JETPLANE_STRICT_PORT: explicitPort ? '1' : '' }
+  const child = spawn('bun', [thin, dir, String(port), imageDir], { stdio: 'inherit', env })
   child.on('exit', (c) => process.exit(c ?? 0))
 }
 
 // `jetplane serve` — thin server only. Assumes the project is already set up (plugin
 // wired, deps installed); builds the bundle if it's missing, then serves it.
-export async function serve({ dir = process.cwd(), port = 8091 } = {}) {
+export async function serve({ dir = process.cwd(), port = 8091, explicit = false } = {}) {
   log(`serving ${dir}`)
+  ensureResolvable(dir)
   const imageDir = await ensureBundle(dir)
-  serveThin(dir, port, imageDir)
+  serveThin(dir, port, imageDir, explicit)
 }
 
 // `jetplane dev` (alias `start`) — the unified one-liner for a fresh project:
 // wire the plugin, install deps, build the bundle once, then serve it.
-export async function start({ dir = process.cwd(), port = 8091 } = {}) {
+export async function start({ dir = process.cwd(), port = 8091, explicit = false } = {}) {
   log(`starting in ${dir}`)
   ensureConfig(dir)
   ensureInstalled(dir)
+  ensureResolvable(dir)
   const imageDir = await ensureBundle(dir)
-  serveThin(dir, port, imageDir)
+  serveThin(dir, port, imageDir, explicit)
 }

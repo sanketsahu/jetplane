@@ -25,6 +25,10 @@ Usage:
   jetplane --help      Show this help
   jetplane --version   Print the version
 
+Options (dev / serve):
+  -p, --port <n>       Port to serve on (default 8091, or $PORT). An explicit port is
+                       strict: if it's taken, jetplane exits rather than picking another.
+
 Two ways to use it:
   • Plugin only (recommended, plain Node): 'jetplane init', then your normal
     'npx expo start' — every same-dep project shares one transform cache, so cold
@@ -64,17 +68,47 @@ function init() {
   console.log(`wrote metro.config.js — run 'npx expo start' to use the shared cache.`)
 }
 
+// Port selection, matching `expo start`'s surface: -p/--port, either space- or
+// =-separated, plus $PORT as the fallback (what most Linux hosts/PaaS set). An explicitly
+// requested port is honored strictly — the server fails loudly instead of silently
+// drifting to the next free one, which would hand a reverse proxy the wrong upstream.
+const DEFAULT_PORT = 8091
+
 function parsePort() {
-  const i = process.argv.indexOf('--port')
-  return i > -1 ? parseInt(process.argv[i + 1], 10) : 8091
+  const argv = process.argv.slice(2)
+  let raw = null
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    const m = /^(?:-p|--port)(?:=(.*))?$/.exec(a)
+    if (!m) continue
+    raw = m[1] !== undefined ? m[1] : argv[++i]
+    break
+  }
+  const explicit = raw != null || process.env.PORT != null
+  if (raw == null) raw = process.env.PORT ?? String(DEFAULT_PORT)
+  const port = Number(raw)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    console.error(`jetplane: invalid port ${JSON.stringify(raw)} — expected an integer 1-65535.`)
+    process.exit(1)
+  }
+  return { port, explicit }
+}
+
+// A setup failure (Metro won't boot, no free port) is a user-facing problem, not a crash —
+// print the message we built and exit, without a node stack trace on top of it.
+async function run(fn) {
+  try { await fn() } catch (e) {
+    console.error(`\njetplane: ${e?.message ?? e}`)
+    process.exit(1)
+  }
 }
 
 if (cmd === '--version' || cmd === '-v') console.log(pkg.version)
 else if (cmd === 'init') init()
 else if (cmd === 'serve') {
   const { serve } = await import('../src/jetplane-start.mjs')
-  await serve({ dir: process.cwd(), port: parsePort() })
+  await run(() => serve({ dir: process.cwd(), ...parsePort() }))
 } else if (cmd === 'dev' || cmd === 'start') {
   const { start } = await import('../src/jetplane-start.mjs')
-  await start({ dir: process.cwd(), port: parsePort() })
+  await run(() => start({ dir: process.cwd(), ...parsePort() }))
 } else console.log(HELP)

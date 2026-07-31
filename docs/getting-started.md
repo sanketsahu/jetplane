@@ -89,7 +89,20 @@ The dev server takes interactive keys, like `expo start`:
 w │ web      i │ iOS simulator      a │ Android      ? │ help      q │ quit
 ```
 
-(If a port is busy the server steps to the next free one and prints the URLs for it.)
+### Choosing the port
+
+```bash
+npx jetplane dev --port 8081     # -p, --port=8081 and $PORT all work
+```
+
+The default is `8091`. With no explicit port, a busy port makes the server step to the next
+free one and print the URLs for it. A port you *did* ask for is strict — if it's taken,
+jetplane exits with an error rather than drifting, so a reverse proxy or tunnel pointed at
+that port can't end up talking to nothing.
+
+Behind a proxy, also set `EXPO_DEV_SERVER_ORIGIN` (a full origin, e.g.
+`https://dev.example.com`) so the manifest advertises the public URL instead of the bind
+address.
 
 ## Run the benchmarks
 

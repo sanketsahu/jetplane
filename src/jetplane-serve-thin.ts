@@ -7,6 +7,7 @@
 
 import path from 'node:path'
 import fs from 'node:fs'
+import os from 'node:os'
 import { createRequire } from 'node:module'
 import { execSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -17,9 +18,15 @@ const projectDir = process.argv[2]
 let port = parseInt(process.argv[3] || '8091', 10)
 const imageDir = process.argv[4] || `${process.env.HOME}/.jetplane/images/expo54`
 
+// The address a phone or another host on the network uses to reach us. `ipconfig` is
+// macOS-only, so fall back to the first non-internal IPv4 interface — that's what works
+// on a Linux box, where en0/en1 don't exist.
 function lanIP(): string {
   for (const dev of ['en0', 'en1']) {
     try { const ip = execSync(`ipconfig getifaddr ${dev}`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(); if (ip) return ip } catch {}
+  }
+  for (const addrs of Object.values(os.networkInterfaces())) {
+    for (const a of addrs ?? []) if (a.family === 'IPv4' && !a.internal) return a.address
   }
   return 'localhost'
 }
@@ -200,7 +207,10 @@ const serveOpts = {
 
 // Bind the port, stepping to the next one if it's busy — a machine may already be
 // running other jetplane servers (or the previous one hasn't exited yet).
-const MAX_PORT_TRIES = 20
+// ...unless the user asked for a specific port (-p/--port/$PORT), in which case drifting
+// would silently break whatever is pointed at it (a proxy, a tunnel, a firewall rule).
+const STRICT_PORT = process.env.JETPLANE_STRICT_PORT === '1'
+const MAX_PORT_TRIES = STRICT_PORT ? 1 : 20
 let server: any
 for (let attempt = 0; ; attempt++) {
   try {
@@ -208,6 +218,10 @@ for (let attempt = 0; ; attempt++) {
     break
   } catch (e: any) {
     const busy = e?.code === 'EADDRINUSE' || /EADDRINUSE|address already in use|is in use/i.test(String(e?.message ?? e))
+    if (busy && STRICT_PORT) {
+      console.error(`jetplane: port ${port} is already in use. Free it, or pass a different --port.`)
+      process.exit(1)
+    }
     if (busy && attempt < MAX_PORT_TRIES - 1) {
       console.log(`jetplane: port ${port} is in use — trying ${port + 1}...`)
       port++
