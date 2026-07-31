@@ -8,6 +8,11 @@ Install jetplane as a dev dependency — Metro resolves `jetplane/transformer` f
 project, so a local install is required (a global `-g` install is optional sugar for the
 CLI, not a substitute). Run the CLI with `npx` or an npm script.
 
+> `npx jetplane <cmd>` runs the CLI out of npx's cache, which does **not** make it
+> resolvable from your project. `jetplane init` and `serve` refuse to run without the local
+> install rather than write a `metro.config.js` that Metro can't load; `jetplane dev`
+> installs it for you.
+
 ```bash
 npm install -D jetplane
 npx jetplane init       # wires the transform cache into metro.config.js
@@ -24,18 +29,26 @@ npx jetplane dev        # unified: init + install + build + serve — for a fres
 npx jetplane            # no argument → prints help
 ```
 
-`jetplane init` writes (or tells you to add) two lines:
+`jetplane init` creates `metro.config.js` if you don't have one, or wires the plugin into
+the one you do have:
 
 ```js
 // metro.config.js
 const { getDefaultConfig } = require('expo/metro-config')
 
 const config = getDefaultConfig(__dirname)
+// wrap whatever transformer is already configured, so its behavior is preserved —
+// jetplane only adds a cross-project cache around it
+config.transformer.upstreamTransformerPath = config.transformerPath
 config.transformerPath = require.resolve('jetplane/transformer') // the Metro plugin
 config.cacheStores = []                                          // jetplane owns caching
 
 module.exports = config
 ```
+
+If your config exports a call rather than a bare object — `module.exports =
+withNativeWind(config, ...)` — the wiring binds that result first, so NativeWind's (or any
+other wrapper's) transformer becomes the upstream instead of being replaced.
 
 The first bundle populates a shared, content-addressed cache under `~/.jetplane`. Every
 other same-dep project (and every restart) reuses it, so cold bundles stop re-transforming

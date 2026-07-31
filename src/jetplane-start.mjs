@@ -8,14 +8,13 @@
 // The thin server + build step are experimental and need Bun; the plugin step alone works
 // on plain Node (that's what `jetplane init` does).
 
-import { spawn, execSync } from 'node:child_process'
+import { spawn, execSync, execFileSync } from 'node:child_process'
 import net from 'node:net'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { createRequire } from 'node:module'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const HOME = os.homedir()
@@ -66,9 +65,15 @@ module.exports = __jetplaneConfig;
 // 1. ensure metro.config.js wires in the plugin
 export function ensureConfig(dir) {
   const cfg = path.join(dir, 'metro.config.js')
-  if (!fs.existsSync(cfg)) { fs.writeFileSync(cfg, DEFAULT_CONFIG); log('created metro.config.js with the jetplane plugin'); return }
-  let s = fs.readFileSync(cfg, 'utf8')
-  if (s.includes('jetplane/transformer')) { log('plugin already in metro.config.js'); return }
+  let s = fs.existsSync(cfg) ? fs.readFileSync(cfg, 'utf8') : null
+  if (s?.includes('jetplane/transformer')) { log('plugin already in metro.config.js'); return }
+
+  // Never write wiring the project can't resolve. The line we add is
+  // require.resolve('jetplane/transformer'), so without a local install Metro dies loading
+  // its own config — and that breaks plain `expo start` too, not just jetplane.
+  if (!jetplaneResolvable(dir)) throw notInstalledError(dir)
+
+  if (s === null) { fs.writeFileSync(cfg, DEFAULT_CONFIG); log('created metro.config.js with the jetplane plugin'); return }
   const idx = s.lastIndexOf('module.exports')
   const eq = idx > -1 ? s.indexOf('=', idx) : -1
   if (eq > -1) {
@@ -119,25 +124,62 @@ function imageKey(dir) {
   return h.digest('hex').slice(0, 16)
 }
 
-// The wiring we write into metro.config.js is `require.resolve('jetplane/transformer')`,
-// which Metro resolves from the PROJECT root. Running the CLI through `npx` doesn't put
-// jetplane there — it lives in npx's cache — so Metro dies on an unresolvable require
-// before it ever serves. Catch that here, where we can say so, instead of letting it
-// surface as an opaque 'Metro did not start'.
+// Can the PROJECT resolve 'jetplane/transformer'? That is what metro.config.js does, and
+// Metro resolves it from the project root — running the CLI through npx doesn't put
+// jetplane there, so Metro would die on an unresolvable require before it ever serves.
+//
+// The check runs in a CHILD process on purpose: Node caches package.json lookups for the
+// lifetime of a process, so an in-process check that ran before an install keeps reporting
+// 'missing' afterwards, making a successful auto-install look like a failure.
+export function jetplaneResolvable(dir) {
+  const script = `require('node:module').createRequire(process.argv[1]).resolve('jetplane/transformer')`
+  try {
+    execFileSync(process.execPath, ['-e', script, path.join(dir, 'package.json')], { stdio: 'ignore' })
+    return true
+  } catch { return false }
+}
+
+export function notInstalledError(dir) {
+  return new Error(
+    `jetplane is not installed in this project (${dir}).\n\n` +
+    `Metro resolves 'jetplane/transformer' from the project root, so running the CLI via npx\n` +
+    `is not enough — jetplane has to be a dependency here:\n\n  npm install -D jetplane\n\n` +
+    `(then re-run; the CLI itself can still be invoked with npx.)`
+  )
+}
+
 function ensureResolvable(dir) {
   const cfg = path.join(dir, 'metro.config.js')
   if (!fs.existsSync(cfg)) return
   if (!fs.readFileSync(cfg, 'utf8').includes('jetplane/transformer')) return
+  if (!jetplaneResolvable(dir)) throw notInstalledError(dir)
+}
+
+// `dev` is the unified fresh-project command and already installs dependencies, so when
+// jetplane itself is missing from the project it installs that too rather than stopping.
+// It must run BEFORE the config is written: writing wiring the project cannot resolve
+// breaks plain `expo start` as well, leaving the project worse off than before.
+function ensureJetplaneDep(dir) {
+  if (jetplaneResolvable(dir)) return
+  const version = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8')).version
+  const spec = `jetplane@${version}`
+  const cmd = has('bun') ? `bun add -d ${spec}` : has('pnpm') ? `pnpm add -D ${spec}` : `npm install -D ${spec}`
+  log(`jetplane is not a dependency of this project — Metro resolves the transformer from`)
+  log(`the project root, so installing it here (${cmd})...`)
   try {
-    createRequire(path.join(dir, 'package.json')).resolve('jetplane/transformer')
+    execSync(cmd, { cwd: dir, stdio: 'inherit' })
   } catch {
+    // The installer printed its own reason above. The version is pinned to this CLI's, so
+    // the usual cause is that version not being on the registry (a local or prerelease
+    // build) — say so rather than repeating 'not installed'.
     throw new Error(
-      `metro.config.js requires 'jetplane/transformer', but jetplane is not installed in this project.\n\n` +
-      `Metro resolves the transformer from the project root, so running the CLI via npx is not enough —\n` +
-      `jetplane has to be a dependency here:\n\n  npm install -D jetplane\n\n` +
-      `(then re-run; the CLI itself can still be invoked with npx.)`
+      `could not install ${spec} into this project (see the installer output above).\n\n` +
+      `jetplane pins the transformer to the CLI's own version so the two can't drift.\n` +
+      `If ${spec} isn't published, install a version that is:\n\n  npm install -D jetplane\n`
     )
   }
+  if (!jetplaneResolvable(dir)) throw notInstalledError(dir)
+  log(`installed ${spec}`)
 }
 
 // Prefer the project's own expo binary over `npx expo`. `npx` inside an npx-run CLI can
@@ -295,12 +337,14 @@ export async function serve({ dir = process.cwd(), port = 8091, explicit = false
 }
 
 // `jetplane dev` (alias `start`) — the unified one-liner for a fresh project:
-// wire the plugin, install deps, build the bundle once, then serve it.
+// install deps, make jetplane resolvable from the project, wire the plugin, build the
+// bundle once, then serve it. Order matters: deps must exist before jetplane can be added
+// to them, and jetplane must resolve before its wiring is written into metro.config.js.
 export async function start({ dir = process.cwd(), port = 8091, explicit = false } = {}) {
   log(`starting in ${dir}`)
-  ensureConfig(dir)
   ensureInstalled(dir)
-  ensureResolvable(dir)
+  ensureJetplaneDep(dir)
+  ensureConfig(dir)
   const imageDir = await ensureBundle(dir)
   serveThin(dir, port, imageDir, explicit)
 }

@@ -2,9 +2,7 @@
 // jetplane CLI (Node). The shippable, no-Bun surface: wire the cross-project transform
 // cache into an Expo project's Metro. The thin-serve + HMR modes are experimental and
 // run under Bun (see the repo docs).
-import { readFileSync, writeFileSync, existsSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
-import path from 'node:path'
+import { readFileSync } from 'node:fs'
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 const [cmd] = process.argv.slice(2)
@@ -13,10 +11,12 @@ const HELP = `jetplane ${pkg.version}
 
 Cross-project transform cache + thin no-Metro dev server for Expo/React Native.
 
-Install it as a project dev dependency (Metro resolves 'jetplane/transformer' from
-there), then run the CLI with npx:
+jetplane has to be a project dev dependency — Metro resolves 'jetplane/transformer'
+from the project root, so running the CLI via npx alone is not enough:
 
   npm install -D jetplane
+
+('jetplane dev' installs it for you; 'jetplane init' and 'serve' expect it to be there.)
 
 Usage:
   jetplane dev         Fresh project: wire the plugin + install deps + build + serve (unified)
@@ -40,32 +40,13 @@ Two ways to use it:
 
 Docs: ${pkg.homepage}`
 
-const CONFIG = `const { getDefaultConfig } = require('expo/metro-config');
-
-const config = getDefaultConfig(__dirname);
-
-// jetplane: cross-project transform cache. Same module transforms once and is reused
-// across every same-dep project (which Metro's own root-dependent cache cannot do).
-// Wrap whatever transformer is already configured (Expo's default here, or NativeWind's
-// when withNativeWind runs) so their behavior is preserved — jetplane only caches around it.
-config.transformer.upstreamTransformerPath = config.transformerPath;
-config.transformerPath = require.resolve('jetplane/transformer');
-config.cacheStores = []; // jetplane owns caching
-
-module.exports = config;
-`
-
-function init() {
-  const target = path.join(process.cwd(), 'metro.config.js')
-  if (existsSync(target)) {
-    console.error(`metro.config.js already exists. Add these lines just before your module.exports (use the final config object — e.g. the return of withNativeWind):\n
-  config.transformer.upstreamTransformerPath = config.transformerPath;
-  config.transformerPath = require.resolve('jetplane/transformer');
-  config.cacheStores = [];\n`)
-    process.exit(1)
-  }
-  writeFileSync(target, CONFIG)
-  console.log(`wrote metro.config.js — run 'npx expo start' to use the shared cache.`)
+// Config writing lives in one place (src/jetplane-start.mjs), so `init` and `dev` produce
+// identical wiring and share the guard that refuses to write it when jetplane isn't
+// installed in the project. Unlike `dev`, `init` never installs anything — it only wires.
+async function init() {
+  const { ensureConfig } = await import('../src/jetplane-start.mjs')
+  ensureConfig(process.cwd())
+  console.log(`jetplane: run 'npx expo start' to use the shared cache.`)
 }
 
 // Port selection, matching `expo start`'s surface: -p/--port, either space- or
@@ -104,7 +85,7 @@ async function run(fn) {
 }
 
 if (cmd === '--version' || cmd === '-v') console.log(pkg.version)
-else if (cmd === 'init') init()
+else if (cmd === 'init') await run(init)
 else if (cmd === 'serve') {
   const { serve } = await import('../src/jetplane-start.mjs')
   await run(() => serve({ dir: process.cwd(), ...parsePort() }))
