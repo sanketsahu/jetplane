@@ -12,7 +12,7 @@ import { createRequire } from 'node:module'
 import { execSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 // @ts-ignore - sibling ESM helper
-import { parseBundle, makeUpdate } from './jetplane-hmr.mjs'
+import { parseBundle, parseBundleSource, makeUpdate, makeDriftUpdate } from './jetplane-hmr.mjs'
 
 const projectDir = process.argv[2]
 let port = parseInt(process.argv[3] || '8091', 10)
@@ -82,13 +82,71 @@ const webHtml = hasWeb ? fs.readFileSync(webHtmlPath, 'utf8') : ''
 const webBundle = hasWeb ? ((globalThis as any).Bun.mmap(webBundlePath) as Uint8Array) : null
 
 // HMR: each target's maps come from its own bundle (parsed above); web has its own too.
-const webMaps = hasWeb ? parseBundle(webBundlePath) : null
+let webMaps = hasWeb ? parseBundle(webBundlePath) : null
+let webBundleLive: Uint8Array | null = webBundle
+
+// ── bundle patching ───────────────────────────────────────────────────────────
+// The baked image can be STALE relative to the project on disk — in RapidNative,
+// docker images are baked from the template scaffold and every real project adds
+// its own route files on top (and live edits/new files keep arriving after boot).
+// An update's modules get appended to the served bundle just before the trailing
+// __r() calls: Metro's `__d` is last-write-wins for unevaluated defs, so re-defs
+// replace baked modules and new defs simply exist. Maps are re-parsed from the
+// patched source so later HMR edits resolve against the post-patch graph.
+// Patch state per platform: the immutable baked base plus one entry per module id —
+// an id edited twice keeps ONE def (the latest), so the served bundle doesn't grow
+// with every edit. Def order is irrelevant: all __d defs are lazy and precede the
+// trailing __r() calls.
+const patchState = new Map<string, { base: string; insertAt: number; mods: Map<number, string> }>()
+function patchTargetBundle(platform: string, upd: { modified: any[]; added: any[] }) {
+  const entries = [...(upd.added || []), ...(upd.modified || [])]
+  if (!entries.length) return
+  const isWeb = platform === 'web'
+  let st = patchState.get(platform)
+  if (!st) {
+    const cur = isWeb ? webBundleLive : targets.get(platform)?.bundle
+    if (!cur) return
+    const base = new TextDecoder().decode(cur)
+    const insertAt = base.lastIndexOf('\n__r(')
+    st = { base, insertAt: insertAt >= 0 ? insertAt : base.length, mods: new Map() }
+    patchState.set(platform, st)
+  }
+  for (const e of entries) st.mods.set(e.module[0], e.module[1])
+  const patch = '\n' + [...st.mods.values()].join('\n') + '\n'
+  const next = st.base.slice(0, st.insertAt) + patch + st.base.slice(st.insertAt)
+  const bytes = new TextEncoder().encode(next)
+  const maps = parseBundleSource(next)
+  if (isWeb) { webBundleLive = bytes; webMaps = maps }
+  else { const t = targets.get(platform)!; t.bundle = bytes; t.maps = maps }
+}
+
+// Boot-time freshening: reconcile the served bundles with the project as it is on
+// disk right now (added/removed route files; changed files when the image carries
+// a files.json bake manifest). Runs before the server accepts traffic so the very
+// first bundle request already includes the drift.
+const bakeManifestPath = path.join(imageDir, 'files.json')
+const bakeManifest = fs.existsSync(bakeManifestPath) ? JSON.parse(fs.readFileSync(bakeManifestPath, 'utf8')) : null
+async function freshenAtBoot() {
+  const plats: string[] = [...targets.keys(), ...(hasWeb ? ['web'] : [])]
+  for (const p of plats) {
+    const m = p === 'web' ? webMaps : targets.get(p)?.maps
+    if (!m) continue
+    try {
+      const upd = await makeDriftUpdate(projectDir, m, `http://localhost:${port}`, p, bakeManifest)
+      if (!upd) continue
+      patchTargetBundle(p, upd)
+      console.log(`jetplane[${p}]: freshened stale image (+${upd.added.length} new module(s), ${upd.modified.length} redefined)`)
+    } catch (e: any) {
+      console.log(`jetplane[${p}]: image freshen skipped -`, e.message)
+    }
+  }
+}
+
 const clients = new Set<any>()
 const clientPlatform = new Map<any, string>() // ws -> 'ios' | 'android' | 'web'
 const lan = lanIP()
 let rev = 0
 async function pushUpdate(absFile: string) {
-  if (clients.size === 0) return
   // Group connected clients by platform — web and native have different module ids, so
   // each group gets an update built against its own bundle maps + transform options.
   const groups = new Map<string, any[]>()
@@ -96,17 +154,23 @@ async function pushUpdate(absFile: string) {
     const p = clientPlatform.get(ws) || 'ios'
     ;(groups.get(p) ?? groups.set(p, []).get(p)!).push(ws)
   }
-  for (const [platform, wss] of groups) {
+  // Every present platform gets processed even with no client connected: the update
+  // also PATCHES the served bundle, so a reload (or a device that connects later)
+  // sees the edit / the new route file.
+  const plats: string[] = [...targets.keys(), ...(hasWeb ? ['web'] : [])]
+  for (const platform of plats) {
     const m = platform === 'web' ? webMaps : targets.get(platform)?.maps
     if (!m) continue
+    const wss = groups.get(platform) || []
     try {
       const { modified, added } = await makeUpdate(projectDir, absFile, m, publicOrigin(), platform)
       rev++
       const start = JSON.stringify({ type: 'update-start', body: { isInitialUpdate: false } })
-      const upd = JSON.stringify({ type: 'update', body: { revisionId: String(rev), added, modified: [modified], deleted: [] } })
+      const upd = JSON.stringify({ type: 'update', body: { revisionId: String(rev), added, modified, deleted: [] } })
       const done = JSON.stringify({ type: 'update-done' })
       for (const ws of wss) { ws.send(start); ws.send(upd); ws.send(done) }
-      console.log(`hmr[${platform}]: pushed ${path.relative(projectDir, absFile)} (module ${modified.module[0]}, +${added.length} new) to ${wss.length} client(s)`)
+      patchTargetBundle(platform, { modified, added })
+      console.log(`hmr[${platform}]: pushed ${path.relative(projectDir, absFile)} (${modified.length} modified, +${added.length} new) to ${wss.length} client(s)`)
     } catch (e: any) {
       console.log(`hmr[${platform}]: skip`, path.relative(projectDir, absFile), '-', e.message)
     }
@@ -193,7 +257,7 @@ const serveOpts = {
     // web target: the self-contained web bundle, and the HTML shell for a browser.
     if (hasWeb) {
       if (url.pathname === '/jetplane-web.bundle') {
-        return new Response(webBundle, { headers: { 'content-type': 'application/javascript', 'x-jetplane-rss-mb': rssMB() } })
+        return new Response(webBundleLive, { headers: { 'content-type': 'application/javascript', 'x-jetplane-rss-mb': rssMB() } })
       }
       const wantsHtml = (req.headers.get('accept') || '').includes('text/html') && !req.headers.get('expo-platform')
       if (wantsHtml && (url.pathname === '/' || url.pathname === '/index.html')) {
@@ -205,7 +269,7 @@ const serveOpts = {
     // silent fallback to another platform's bundle — that boots to a broken app.
     const platform = platformOf(req, url)
     if (platform === 'web' && hasWeb && url.pathname.endsWith('.bundle')) {
-      return new Response(webBundle, { headers: { 'content-type': 'application/javascript', 'x-jetplane-platform': 'web', 'x-jetplane-rss-mb': rssMB() } })
+      return new Response(webBundleLive, { headers: { 'content-type': 'application/javascript', 'x-jetplane-platform': 'web', 'x-jetplane-rss-mb': rssMB() } })
     }
     const target = targets.get(platform)
     if (!target) {
@@ -244,9 +308,10 @@ const serveOpts = {
       try { data = JSON.parse(String(msg)) } catch { return }
       if (data.type === 'register-entrypoints') {
         // The entry-point URL carries the platform, so we know which bundle maps to
-        // build this client's HMR updates against.
+        // build this client's HMR updates against. The browser's entrypoint is our own
+        // /jetplane-web.bundle, which has no ?platform= — match it by name.
         const eps = Array.isArray(data.entryPoints) ? data.entryPoints.join(' ') : String(data.entryPoints ?? '')
-        const platform = /platform=web/.test(eps) ? 'web' : /platform=android/.test(eps) ? 'android' : 'ios'
+        const platform = /platform=web|jetplane-web\.bundle/.test(eps) ? 'web' : /platform=android/.test(eps) ? 'android' : 'ios'
         clientPlatform.set(ws, platform)
         ws.send(JSON.stringify({ type: 'bundle-registered' }))
       }
@@ -258,6 +323,10 @@ const serveOpts = {
 // running other jetplane servers (or the previous one hasn't exited yet).
 // ...unless the user asked for a specific port (-p/--port/$PORT), in which case drifting
 // would silently break whatever is pointed at it (a proxy, a tunnel, a firewall rule).
+// Reconcile the baked image with the project on disk BEFORE accepting traffic —
+// the very first bundle request must already carry post-bake route files.
+await freshenAtBoot()
+
 const STRICT_PORT = process.env.JETPLANE_STRICT_PORT === '1'
 const MAX_PORT_TRIES = STRICT_PORT ? 1 : 20
 let server: any

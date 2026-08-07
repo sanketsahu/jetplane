@@ -227,14 +227,49 @@ function bundleFailure(res) {
 // (which is what a single-platform image forced) cannot work.
 const NATIVE_PLATFORMS = ['ios', 'android']
 
+// Family key: deps + bundle-affecting config, NO app source and NO project path. Two
+// trees in the same family differ only in app source — which the thin server reconciles
+// at boot (freshening) — so a family match is servable without a Metro rebuild.
+function familyKey(dir) {
+  const h = crypto.createHash('sha256')
+  const add = (p) => { try { if (fs.statSync(p).isFile()) h.update(fs.readFileSync(p)) } catch {} }
+  for (const f of ['bun.lock', 'bun.lockb', 'pnpm-lock.yaml', 'package-lock.json', 'yarn.lock']) {
+    const p = path.join(dir, f); if (fs.existsSync(p)) { add(p); break }
+  }
+  for (const f of ['app.json', 'app.config.js', 'app.config.ts', 'metro.config.js', 'babel.config.js', 'global.css', 'tailwind.config.js']) add(path.join(dir, f))
+  return h.digest('hex').slice(0, 16)
+}
+
 async function ensureBundle(dir) {
   const imageDir = path.join(HOME, '.jetplane', 'images', imageKey(dir))
   const required = NATIVE_PLATFORMS.flatMap((p) => [`main.${p}.bundle`, `manifest-multipart.${p}.bin`, `manifest.${p}.json`])
-  if (required.every((f) => fs.existsSync(path.join(imageDir, f)))) {
+  const complete = (d) => required.every((f) => fs.existsSync(path.join(d, f)))
+  if (complete(imageDir)) {
     // Web is captured best-effort, so it must not gate completeness — a failed
     // web capture used to force a full rebuild on every boot, forever.
     if (!fs.existsSync(path.join(imageDir, 'main.web.bundle'))) log('note: no web bundle in this image (web capture skipped at build)')
     log(`bundle cached (${path.relative(HOME, imageDir)})`); return imageDir
+  }
+  // Exact miss (the app source changed since the image was built). A same-FAMILY image
+  // — same deps + config — is still servable: the thin server reconciles source drift
+  // at boot. This is the production path: docker images are baked from the template
+  // scaffold, and every real project's tree differs from it the moment files are added.
+  // Rebuilding here instead would turn every boot into a cold Metro build.
+  const fam = familyKey(dir)
+  const imagesRoot = path.join(HOME, '.jetplane', 'images')
+  let best = null
+  for (const name of fs.existsSync(imagesRoot) ? fs.readdirSync(imagesRoot) : []) {
+    const d = path.join(imagesRoot, name)
+    const famFile = path.join(d, 'family.json')
+    try {
+      if (JSON.parse(fs.readFileSync(famFile, 'utf8')).family !== fam || !complete(d)) continue
+      const mtime = fs.statSync(famFile).mtimeMs
+      if (!best || mtime > best.mtime) best = { d, mtime }
+    } catch {}
+  }
+  if (best) {
+    log(`serving same-family image ${path.relative(HOME, best.d)} — app source drift is reconciled at boot`)
+    return best.d
   }
   fs.mkdirSync(imageDir, { recursive: true })
   log('building bundle (running Metro once — this is the one-time build)...')
@@ -256,6 +291,12 @@ async function ensureBundle(dir) {
     // that is mid-provision behind a gateway).
     delete buildEnv.EXPO_PACKAGER_PROXY_URL
     delete buildEnv.REACT_NATIVE_PACKAGER_HOSTNAME
+    // The captured bundle must be self-contained: expo-router's import mode
+    // decides whether route screens are statically required into the bundle
+    // (its default varies by version/platform), and lazily-imported routes
+    // become deferred chunks nobody captures — navigation breaks and HMR has
+    // no module ids for screens. Callers can still override explicitly.
+    if (!buildEnv.EXPO_ROUTER_IMPORT_MODE) buildEnv.EXPO_ROUTER_IMPORT_MODE = 'sync'
     metro = spawn(cmd, [...pre, 'start', '--port', String(port)], { cwd: dir, env: buildEnv, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
     const out = []
     const collect = (b) => { for (const l of String(b).split('\n')) if (l.trim()) { out.push(l); if (out.length > 60) out.shift() } }
@@ -327,6 +368,29 @@ async function ensureBundle(dir) {
         } else log('web capture skipped (bundle request failed)')
       } else log('web capture skipped (no web entry in HTML — is react-native-web installed?)')
     } catch (e) { log(`web capture skipped (${e.message})`) }
+
+    // Bake manifest: rel -> sha256 of every app source file AT CAPTURE TIME. The thin
+    // server diffs this against the project on boot to re-transform files that changed
+    // after the image was baked (added/removed route files are detected without it).
+    const manifest = {}
+    for (const root of ['app', 'components', 'src', 'constants', 'hooks']) {
+      const walk = (d) => {
+        let ents
+        try { ents = fs.readdirSync(d, { withFileTypes: true }) } catch { return }
+        for (const e of ents) {
+          if (e.name.startsWith('.')) continue
+          const p = path.join(d, e.name)
+          if (e.isDirectory()) walk(p)
+          else if (/\.[tj]sx?$/.test(e.name) && !e.name.endsWith('.d.ts')) {
+            manifest[path.relative(dir, p).split(path.sep).join('/')] =
+              crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex')
+          }
+        }
+      }
+      walk(path.join(dir, root))
+    }
+    fs.writeFileSync(path.join(imageDir, 'files.json'), JSON.stringify(manifest))
+    fs.writeFileSync(path.join(imageDir, 'family.json'), JSON.stringify({ family: familyKey(dir) }))
 
     return imageDir
   } finally { kill(); await sleep(500) }

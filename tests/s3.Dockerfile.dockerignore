@@ -1,0 +1,8 @@
+# context = repo root; only bin/, src/, package.json and the fixture source enter
+.git
+node_modules
+bench
+docs
+tests/fixtures/router-app/node_modules
+tests/fixtures/router-app/.expo
+**/.DS_Store

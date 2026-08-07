@@ -26,6 +26,9 @@
   "bin": {
     "jetplane": "./bin/jetplane.mjs"
   },
+  "scripts": {
+    "test": "node tests/run.mjs && node tests/web.mjs"
+  },
   "exports": {
     "./transformer": "./src/jetplane-transformer.cjs",
     "./transform-service": "./src/transform-service.mjs",
@@ -39,5 +42,8 @@
   ],
   "engines": {
     "node": ">=20"
+  },
+  "devDependencies": {
+    "playwright": "^1.62.1"
   }
 }
