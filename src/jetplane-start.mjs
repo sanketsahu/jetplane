@@ -17,7 +17,7 @@ import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
-const HOME = os.homedir()
+const HOME = process.env.JETPLANE_HOME || os.homedir()
 const log = (m) => console.log(`jetplane: ${m}`)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const has = (cmd) => { try { execSync(`command -v ${cmd}`, { stdio: 'ignore' }); return true } catch { return false } }
@@ -229,11 +229,11 @@ const NATIVE_PLATFORMS = ['ios', 'android']
 
 async function ensureBundle(dir) {
   const imageDir = path.join(HOME, '.jetplane', 'images', imageKey(dir))
-  const complete = [
-    ...NATIVE_PLATFORMS.flatMap((p) => [`main.${p}.bundle`, `manifest-multipart.${p}.bin`, `manifest.${p}.json`]),
-    'index.html', 'main.web.bundle',
-  ]
-  if (complete.every((f) => fs.existsSync(path.join(imageDir, f)))) {
+  const required = NATIVE_PLATFORMS.flatMap((p) => [`main.${p}.bundle`, `manifest-multipart.${p}.bin`, `manifest.${p}.json`])
+  if (required.every((f) => fs.existsSync(path.join(imageDir, f)))) {
+    // Web is captured best-effort, so it must not gate completeness — a failed
+    // web capture used to force a full rebuild on every boot, forever.
+    if (!fs.existsSync(path.join(imageDir, 'main.web.bundle'))) log('note: no web bundle in this image (web capture skipped at build)')
     log(`bundle cached (${path.relative(HOME, imageDir)})`); return imageDir
   }
   fs.mkdirSync(imageDir, { recursive: true })
@@ -250,7 +250,13 @@ async function ensureBundle(dir) {
     // Keep Metro's output instead of discarding it: when the build server fails to come
     // up, its stderr is the only thing that says why, and 'Metro did not start' on its
     // own is undiagnosable.
-    metro = spawn(cmd, [...pre, 'start', '--port', String(port)], { cwd: dir, env: { ...process.env, CI: '1' }, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    const buildEnv = { ...process.env, CI: '1' }
+    // The capture Metro serves only this build; proxied/public origins would
+    // leak into the manifests it emits (and can even route back to a server
+    // that is mid-provision behind a gateway).
+    delete buildEnv.EXPO_PACKAGER_PROXY_URL
+    delete buildEnv.REACT_NATIVE_PACKAGER_HOSTNAME
+    metro = spawn(cmd, [...pre, 'start', '--port', String(port)], { cwd: dir, env: buildEnv, detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
     const out = []
     const collect = (b) => { for (const l of String(b).split('\n')) if (l.trim()) { out.push(l); if (out.length > 60) out.shift() } }
     metro.stdout.on('data', collect)
@@ -286,6 +292,16 @@ async function ensureBundle(dir) {
       fs.writeFileSync(path.join(imageDir, `manifest-multipart.${platform}.bin`), multi)
       let url
       try { url = JSON.parse(json).launchAsset.url } catch { throw new Error(`could not read the ${platform} manifest from Metro:\n${json.slice(0, 500)}`) }
+      // Fetch through the local Metro regardless of what the manifest says: a
+      // proxy env (EXPO_PACKAGER_PROXY_URL) makes launchAsset point at a public
+      // origin that may route back to the very server being provisioned.
+      // And force lazy=false: with lazy bundling the entry bundle omits route
+      // screens (they'd be deferred chunks nobody captures), which both breaks
+      // the served app's navigation and leaves HMR without module ids for any
+      // screen file. Web capture below already does the same.
+      url = new URL(new URL(url).pathname + new URL(url).search, base).toString()
+      url = url.replace(/([?&])lazy=true/, '$1lazy=false')
+      if (!/[?&]lazy=/.test(url)) url += (url.includes('?') ? '&' : '?') + 'lazy=false'
       log(`bundling ${platform} (first build may take a moment)...`)
       const bundle = await get(url, 180000)
       if (!bundle.ok) throw new Error(`[${platform}] ${bundleFailure(bundle)}`)

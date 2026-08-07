@@ -16,7 +16,7 @@ import { parseBundle, makeUpdate } from './jetplane-hmr.mjs'
 
 const projectDir = process.argv[2]
 let port = parseInt(process.argv[3] || '8091', 10)
-const imageDir = process.argv[4] || `${process.env.HOME}/.jetplane/images/expo54`
+const imageDir = process.argv[4] || `${process.env.JETPLANE_HOME || process.env.HOME}/.jetplane/images/expo54`
 
 // The address a phone or another host on the network uses to reach us. `ipconfig` is
 // macOS-only, so fall back to the first non-internal IPv4 interface — that's what works
@@ -184,6 +184,10 @@ const serveOpts = {
     const origin = publicOrigin(req)
 
     if (url.pathname === '/hot') { if (server.upgrade(req)) return undefined as any }
+    // Metro's runtime also opens /message (log/event forwarding). Accept and
+    // ignore it — refusing the upgrade shows up as a failed WebSocket in every
+    // client console.
+    if (url.pathname === '/message') { if (server.upgrade(req, { data: { message: true } })) return undefined as any }
     if (url.pathname === '/status') return new Response('packager-status:running')
 
     // web target: the self-contained web bundle, and the HTML shell for a browser.
@@ -200,6 +204,9 @@ const serveOpts = {
     // Everything below is platform-specific. An unknown platform is an error, not a
     // silent fallback to another platform's bundle — that boots to a broken app.
     const platform = platformOf(req, url)
+    if (platform === 'web' && hasWeb && url.pathname.endsWith('.bundle')) {
+      return new Response(webBundle, { headers: { 'content-type': 'application/javascript', 'x-jetplane-platform': 'web', 'x-jetplane-rss-mb': rssMB() } })
+    }
     const target = targets.get(platform)
     if (!target) {
       const msg = `jetplane: no ${platform} bundle in this image (have: ${[...targets.keys()].join(', ')}). Delete ~/.jetplane/images and re-run to rebuild.`
@@ -230,7 +237,7 @@ const serveOpts = {
     return new Response(rewriteHost(freshen(target.manifestRaw), origin), { headers: { 'content-type': 'application/expo+json', 'x-jetplane-platform': platform, 'cache-control': 'private, max-age=0' } })
   },
   websocket: {
-    open(ws: any) { clients.add(ws) },
+    open(ws: any) { if (!ws.data?.message) clients.add(ws) },
     close(ws: any) { clients.delete(ws); clientPlatform.delete(ws) },
     message(ws: any, msg: any) {
       let data: any = {}

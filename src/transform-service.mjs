@@ -24,7 +24,7 @@ const PRESET = require.resolve('babel-preset-expo')
 const TOOLCHAIN = `babel@${babel.version};preset-expo;v1`
 const PLACEHOLDER = '\0TRAM_ROOT\0'
 
-const STORE = path.join(os.homedir(), '.jetplane', 'store')
+const STORE = path.join(process.env.JETPLANE_HOME || os.homedir(), '.jetplane', 'store')
 fs.mkdirSync(STORE, { recursive: true })
 
 const sha = (s) => crypto.createHash('sha256').update(s).digest('hex')
