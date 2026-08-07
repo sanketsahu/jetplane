@@ -179,6 +179,37 @@ async function runFixture(key) {
     const logTxt = fs.readFileSync(log, 'utf8')
     const bad = logTxt.split('\n').filter((l) => /error|unhandled|traceback/i.test(l) && !/skip |web capture skipped/.test(l))
     record(key, 'log: no errors in server output', bad.length === 0, bad.slice(0, 2).join(' | '))
+
+    // --- F. app rename must NOT invalidate the cached bundle ---
+    // RapidNative rewrites app.json (expo.name) on every project; a rename-triggered
+    // rebuild is the "new project takes forever to load" bug. Reboot the server on
+    // the same cache with a renamed app: it must serve cached and surface the new
+    // name in the manifest.
+    try { process.kill(-srv.pid) } catch {}
+    await until(async () => !(await get(`http://localhost:${port}/status`).then(() => true).catch(() => false)), 15_000, 500)
+    const appJsonPath = path.join(dir, 'app.json')
+    const appJsonOrig = fs.readFileSync(appJsonPath, 'utf8')
+    const renamed = JSON.parse(appJsonOrig)
+    ;(renamed.expo ?? renamed).name = `Renamed ${Date.now()}`
+    fs.writeFileSync(appJsonPath, JSON.stringify(renamed, null, 2))
+    const log2 = path.join(home, 'serve-rename.log')
+    const out2 = fs.openSync(log2, 'w')
+    const srv2 = spawn('node', [path.join(REPO, 'bin', 'jetplane.mjs'), 'serve', '--port', String(port)], {
+      cwd: dir, env: { ...process.env, JETPLANE_HOME: home }, stdio: ['ignore', out2, out2], detached: true,
+    })
+    try {
+      const upR = await until(async () => (await get(`http://localhost:${port}/status`)).ok, 45_000, 1000)
+      const log2Txt = fs.readFileSync(log2, 'utf8')
+      record(key, 'rename: boots from cache (no rebuild)', upR && !log2Txt.includes('building bundle'),
+        log2Txt.includes('building bundle') ? 'rebuild triggered by app.json rename' : upR ? '' : 'server did not come up in 45s')
+      if (upR) {
+        const manR = await (await get(`http://localhost:${port}/`, { headers: { 'expo-platform': 'ios', accept: 'application/expo+json' } })).text()
+        record(key, 'rename: manifest carries new name', manR.includes((renamed.expo ?? renamed).name))
+      }
+    } finally {
+      try { process.kill(-srv2.pid) } catch {}
+      fs.writeFileSync(appJsonPath, appJsonOrig)
+    }
   } finally {
     cleanup()
   }

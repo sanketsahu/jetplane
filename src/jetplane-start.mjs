@@ -102,6 +102,28 @@ function ensureInstalled(dir) {
 // (lockHash) collides for two projects with identical deps — the second serves the first's
 // app. So mix in the project path, bundle-affecting config, and the app source tree; editing
 // app code also invalidates the image, so a fresh `serve` rebuilds instead of serving stale.
+// app.json enters cache keys ONLY through its bundle-affecting fields. RapidNative
+// (and people generally) rename apps — expo.name/slug/scheme/icons change all the
+// time and none of them alter what Metro emits; hashing the raw file made every
+// rename invalidate the baked bundle family and forced a full Metro rebuild at the
+// next boot. Display fields live in the MANIFEST, which the thin server freshens
+// from the current app.json per request (see jetplane-serve-thin.ts).
+function appConfigFingerprint(dir) {
+  const p = path.join(dir, 'app.json')
+  let cfg
+  try { cfg = JSON.parse(fs.readFileSync(p, 'utf8')) } catch { try { return fs.readFileSync(p) } catch { return '' } }
+  const e = cfg.expo ?? cfg
+  const keep = {}
+  for (const k of ['entryPoint', 'plugins', 'experiments', 'jsEngine', 'newArchEnabled', 'sdkVersion', 'platforms']) {
+    if (e[k] !== undefined) keep[k] = e[k]
+  }
+  for (const plat of ['ios', 'android']) {
+    if (e[plat]?.jsEngine !== undefined) keep[`${plat}.jsEngine`] = e[plat].jsEngine
+    if (e[plat]?.newArchEnabled !== undefined) keep[`${plat}.newArchEnabled`] = e[plat].newArchEnabled
+  }
+  return JSON.stringify(keep)
+}
+
 function imageKey(dir) {
   const h = crypto.createHash('sha256')
   h.update(path.resolve(dir))
@@ -109,7 +131,8 @@ function imageKey(dir) {
   for (const f of ['bun.lock', 'bun.lockb', 'pnpm-lock.yaml', 'package-lock.json', 'yarn.lock']) {
     const p = path.join(dir, f); if (fs.existsSync(p)) { add(p); break }
   }
-  for (const f of ['app.json', 'app.config.js', 'app.config.ts', 'metro.config.js', 'babel.config.js', 'global.css', 'tailwind.config.js']) add(path.join(dir, f))
+  h.update(appConfigFingerprint(dir))
+  for (const f of ['app.config.js', 'app.config.ts', 'metro.config.js', 'babel.config.js', 'global.css', 'tailwind.config.js']) add(path.join(dir, f))
   const walk = (d) => {
     let ents
     try { ents = fs.readdirSync(d, { withFileTypes: true }) } catch { return }
@@ -236,7 +259,8 @@ function familyKey(dir) {
   for (const f of ['bun.lock', 'bun.lockb', 'pnpm-lock.yaml', 'package-lock.json', 'yarn.lock']) {
     const p = path.join(dir, f); if (fs.existsSync(p)) { add(p); break }
   }
-  for (const f of ['app.json', 'app.config.js', 'app.config.ts', 'metro.config.js', 'babel.config.js', 'global.css', 'tailwind.config.js']) add(path.join(dir, f))
+  h.update(appConfigFingerprint(dir))
+  for (const f of ['app.config.js', 'app.config.ts', 'metro.config.js', 'babel.config.js', 'global.css', 'tailwind.config.js']) add(path.join(dir, f))
   return h.digest('hex').slice(0, 16)
 }
 

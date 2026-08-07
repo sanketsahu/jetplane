@@ -221,9 +221,26 @@ const rewriteHost = (s: string, origin: string) =>
 // expo-updates stores each loaded manifest in SQLite keyed by (scope_key, commit_time).
 // Our replayed manifest is static, so re-scanning collides (UNIQUE constraint). Give
 // every manifest a fresh id + createdAt so each load is a distinct update.
-const freshen = (s: string): string => s
-  .replace(/"id":"[^"]*"/, `"id":"${randomUUID()}"`)
-  .replace(/"createdAt":"[^"]*"/, `"createdAt":"${new Date().toISOString()}"`)
+//
+// Display fields come from the CURRENT app.json, not the captured one: renaming an
+// app must not require a rebundle (name/slug are manifest data, and the cache keys
+// deliberately ignore them — see appConfigFingerprint in jetplane-start.mjs).
+function currentDisplayFields(): { name?: string; slug?: string } {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(projectDir, 'app.json'), 'utf8'))
+    const e = cfg.expo ?? cfg
+    return { name: e.name, slug: e.slug }
+  } catch { return {} }
+}
+const freshen = (s: string): string => {
+  const d = currentDisplayFields()
+  let out = s
+    .replace(/"id":"[^"]*"/, `"id":"${randomUUID()}"`)
+    .replace(/"createdAt":"[^"]*"/, `"createdAt":"${new Date().toISOString()}"`)
+  if (d.name) out = out.replace(/"name":"(?:[^"\\]|\\.)*"/, `"name":${JSON.stringify(d.name)}`)
+  if (d.slug) out = out.replace(/"slug":"(?:[^"\\]|\\.)*"/, `"slug":${JSON.stringify(d.slug)}`)
+  return out
+}
 
 const rssMB = () => (process.memoryUsage().rss / 1048576).toFixed(1)
 
