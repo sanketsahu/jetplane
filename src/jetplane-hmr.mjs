@@ -174,7 +174,8 @@ function createProcessor(projectDir, maps, clientUrlBase, platform) {
       : { __proto__: null, engine: 'hermes', routerRoot: 'app', reactCompiler: 'true' },
     experimentalImportSupport: false, publicPath: '/assets',
   }
-  const transform = (file) => worker.transform(transformerConfig, projectDir, file, fs.readFileSync(file), options)
+  const transform = (file, sourceOverride) =>
+    worker.transform(transformerConfig, projectDir, file, sourceOverride != null ? Buffer.from(sourceOverride) : fs.readFileSync(file), options)
   const urlFor = (rel) => `${clientUrlBase}/${rel.replace(/\.(t|j)sx?$/, '')}.bundle`
 
   // temp inverse graph so closures include the new module edges we add below
@@ -184,11 +185,11 @@ function createProcessor(projectDir, maps, clientUrlBase, platform) {
   const added = []
   const visited = new Set()
   // transform a module, resolve its deps (collecting new ones), recurse, emit entry
-  const process = async (file, id, rel, isNew, parentId) => {
+  const process = async (file, id, rel, isNew, parentId, sourceOverride) => {
     if (visited.has(id)) return
     visited.add(id)
     if (isNew && parentId != null) addEdge(id, parentId)
-    const r = await transform(file)
+    const r = await transform(file, sourceOverride)
     const factory = r.output[0].data.code
     const newMods = []
     const deps = resolveDeps(maps, file, id, factory, projectDir, newMods, platform)
@@ -316,6 +317,16 @@ export async function makeDriftUpdate(projectDir, maps, clientUrlBase, platform 
 
   if (!modified.length && !P.added.length) return null
   return { modified, added: P.added }
+}
+
+// Update for a REGENERATED module: transform provided source under the module's
+// existing bundle id (used for the nativewind css registry — see jetplane-css.mjs).
+export async function makeSourceUpdate(projectDir, maps, clientUrlBase, platform, rel, source) {
+  const id = maps.pathToId.get(rel)
+  if (id == null) throw new Error(`no module id for ${rel} (not in bundle)`)
+  const P = createProcessor(projectDir, maps, clientUrlBase, platform)
+  const modified = await P.process(path.join(projectDir, rel), id, rel, false, null, source)
+  return { modified: [modified], added: P.added }
 }
 
 // self-test: parse the captured bundle, make an update for (tabs)/index.tsx

@@ -311,6 +311,15 @@ async function runDrift(key) {
     record(key, 'drift: added routes present in served bundle', absent.length === 0,
       absent.length ? `missing: ${absent.join(', ')}` : `${driftFiles.length} delta files present`)
 
+    // nativewind: tailwind classes used ONLY by post-bake screens must reach the
+    // compiled registry (regenerated async at boot — poll). Without this the added
+    // screens hot-load but render UNSTYLED (the production symptom).
+    const cssOk = await until(async () => {
+      const b = await (await get(`http://localhost:${port}/node_modules/expo-router/entry.bundle?platform=ios&dev=true`)).text()
+      return b.includes('"mb-6"') && b.includes('"text-2xl"')
+    }, 60_000, 3000)
+    record(key, 'drift: post-bake tailwind classes in css registry', cssOk, cssOk ? '' : 'mb-6/text-2xl never appeared (registry not refreshed)')
+
     // 4. HMR on a post-bake file
     const abs = path.join(dir, screen)
     const orig = fs.readFileSync(abs, 'utf8')
