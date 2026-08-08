@@ -113,13 +113,17 @@ function appConfigFingerprint(dir) {
   let cfg
   try { cfg = JSON.parse(fs.readFileSync(p, 'utf8')) } catch { try { return fs.readFileSync(p) } catch { return '' } }
   const e = cfg.expo ?? cfg
+  // Only what changes the DEV bundle Metro emits: the entry module and the JS engine
+  // (hermes vs jsc selects the transform profile). Everything else in app.json —
+  // config plugins, newArchEnabled, sdkVersion, experiments.typedRoutes, splash,
+  // icons — affects prebuild/native builds or typegen, NOT the served bundle, and
+  // AI/codegen tools rewrite app.json wholesale (dropping or reordering fields), so
+  // hashing more than this rebuilds constantly for no behavioral difference.
   const keep = {}
-  for (const k of ['entryPoint', 'plugins', 'experiments', 'jsEngine', 'newArchEnabled', 'sdkVersion', 'platforms']) {
-    if (e[k] !== undefined) keep[k] = e[k]
-  }
+  if (e.entryPoint !== undefined) keep.entryPoint = e.entryPoint
+  if (e.jsEngine !== undefined) keep.jsEngine = e.jsEngine
   for (const plat of ['ios', 'android']) {
     if (e[plat]?.jsEngine !== undefined) keep[`${plat}.jsEngine`] = e[plat].jsEngine
-    if (e[plat]?.newArchEnabled !== undefined) keep[`${plat}.newArchEnabled`] = e[plat].newArchEnabled
   }
   return JSON.stringify(keep)
 }
@@ -264,37 +268,57 @@ function familyKey(dir) {
   return h.digest('hex').slice(0, 16)
 }
 
-async function ensureBundle(dir) {
+const REQUIRED_IMAGE_FILES = NATIVE_PLATFORMS.flatMap((p) => [`main.${p}.bundle`, `manifest-multipart.${p}.bin`, `manifest.${p}.json`])
+const completeImage = (d) => REQUIRED_IMAGE_FILES.every((f) => fs.existsSync(path.join(d, f)))
+
+// What can be served RIGHT NOW, best first:
+//   exact  — the image for this very tree
+//   family — same deps + bundle-affecting config; source drift is reconciled at boot
+//            by the thin server (freshening). The production path: docker images are
+//            baked from the template scaffold, and every real project's tree differs
+//            the moment files are added.
+//   stale  — some image exists but its config drifted. Still servable (worst case a
+//            bundle built with slightly-old config) — the caller rebuilds in the
+//            background rather than blocking boot on a cold Metro build.
+function findServableImage(dir) {
   const imageDir = path.join(HOME, '.jetplane', 'images', imageKey(dir))
-  const required = NATIVE_PLATFORMS.flatMap((p) => [`main.${p}.bundle`, `manifest-multipart.${p}.bin`, `manifest.${p}.json`])
-  const complete = (d) => required.every((f) => fs.existsSync(path.join(d, f)))
-  if (complete(imageDir)) {
+  if (completeImage(imageDir)) {
     // Web is captured best-effort, so it must not gate completeness — a failed
     // web capture used to force a full rebuild on every boot, forever.
     if (!fs.existsSync(path.join(imageDir, 'main.web.bundle'))) log('note: no web bundle in this image (web capture skipped at build)')
-    log(`bundle cached (${path.relative(HOME, imageDir)})`); return imageDir
+    return { dir: imageDir, kind: 'exact' }
   }
-  // Exact miss (the app source changed since the image was built). A same-FAMILY image
-  // — same deps + config — is still servable: the thin server reconciles source drift
-  // at boot. This is the production path: docker images are baked from the template
-  // scaffold, and every real project's tree differs from it the moment files are added.
-  // Rebuilding here instead would turn every boot into a cold Metro build.
   const fam = familyKey(dir)
   const imagesRoot = path.join(HOME, '.jetplane', 'images')
   let best = null
+  let newest = null
   for (const name of fs.existsSync(imagesRoot) ? fs.readdirSync(imagesRoot) : []) {
     const d = path.join(imagesRoot, name)
-    const famFile = path.join(d, 'family.json')
+    if (!completeImage(d)) continue
+    let mtime = 0
+    try { mtime = fs.statSync(path.join(d, 'family.json')).mtimeMs } catch { try { mtime = fs.statSync(d).mtimeMs } catch {} }
+    if (!newest || mtime > newest.mtime) newest = { d, mtime }
     try {
-      if (JSON.parse(fs.readFileSync(famFile, 'utf8')).family !== fam || !complete(d)) continue
-      const mtime = fs.statSync(famFile).mtimeMs
-      if (!best || mtime > best.mtime) best = { d, mtime }
+      if (JSON.parse(fs.readFileSync(path.join(d, 'family.json'), 'utf8')).family === fam && (!best || mtime > best.mtime)) best = { d, mtime }
     } catch {}
   }
-  if (best) {
-    log(`serving same-family image ${path.relative(HOME, best.d)} — app source drift is reconciled at boot`)
-    return best.d
+  if (best) return { dir: best.d, kind: 'family' }
+  if (newest) return { dir: newest.d, kind: 'stale' }
+  return null
+}
+
+async function ensureBundle(dir) {
+  const found = findServableImage(dir)
+  if (found?.kind === 'exact') { log(`bundle cached (${path.relative(HOME, found.dir)})`); return found.dir }
+  if (found?.kind === 'family') {
+    log(`serving same-family image ${path.relative(HOME, found.dir)} — app source drift is reconciled at boot`)
+    return found.dir
   }
+  return buildBundle(dir)
+}
+
+async function buildBundle(dir) {
+  const imageDir = path.join(HOME, '.jetplane', 'images', imageKey(dir))
   fs.mkdirSync(imageDir, { recursive: true })
   log('building bundle (running Metro once — this is the one-time build)...')
 
@@ -436,6 +460,19 @@ function serveThin(dir, port, imageDir, explicitPort = false) {
 export async function serve({ dir = process.cwd(), port = 8091, explicit = false } = {}) {
   log(`serving ${dir}`)
   ensureResolvable(dir)
+  const found = findServableImage(dir)
+  if (found?.kind === 'stale') {
+    // Config drifted since the newest image was built. Boot MUST NOT block on a cold
+    // Metro build (that is a minutes-long freeze for whoever is watching the app) —
+    // serve the newest image now and rebuild behind the server; the next restart
+    // gets an exact hit.
+    log(`serving newest image ${path.relative(HOME, found.dir)} despite config drift — rebuilding a fresh image in the background`)
+    buildBundle(dir)
+      .then((d) => log(`background rebuild done (${path.relative(HOME, d)}) — the next restart serves it`))
+      .catch((e) => log(`background rebuild failed: ${e?.message ?? e}`))
+    serveThin(dir, port, found.dir, explicit)
+    return
+  }
   const imageDir = await ensureBundle(dir)
   serveThin(dir, port, imageDir, explicit)
 }

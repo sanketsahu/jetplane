@@ -180,17 +180,27 @@ async function runFixture(key) {
     const bad = logTxt.split('\n').filter((l) => /error|unhandled|traceback/i.test(l) && !/skip |web capture skipped/.test(l))
     record(key, 'log: no errors in server output', bad.length === 0, bad.slice(0, 2).join(' | '))
 
-    // --- F. app rename must NOT invalidate the cached bundle ---
-    // RapidNative rewrites app.json (expo.name) on every project; a rename-triggered
-    // rebuild is the "new project takes forever to load" bug. Reboot the server on
-    // the same cache with a renamed app: it must serve cached and surface the new
-    // name in the manifest.
+    // --- F. an AI-style app.json rewrite must NOT invalidate the cached bundle ---
+    // RapidNative's agent rewrites app.json WHOLESALE: rename, restyled splash inside
+    // `plugins`, and it drops fields it doesn't know about (experiments, newArchEnabled,
+    // sdkVersion — observed in production, project alekib6w3w). None of that changes
+    // the dev bundle, so a reboot on the same cache must serve cached and surface the
+    // new name in the manifest. A rebuild here is the "expo server froze for minutes"
+    // bug.
     try { process.kill(-srv.pid) } catch {}
     await until(async () => !(await get(`http://localhost:${port}/status`).then(() => true).catch(() => false)), 15_000, 500)
     const appJsonPath = path.join(dir, 'app.json')
     const appJsonOrig = fs.readFileSync(appJsonPath, 'utf8')
     const renamed = JSON.parse(appJsonOrig)
-    ;(renamed.expo ?? renamed).name = `Renamed ${Date.now()}`
+    const exp = renamed.expo ?? renamed
+    exp.name = `Renamed ${Date.now()}`
+    delete exp.experiments
+    delete exp.newArchEnabled
+    delete exp.sdkVersion
+    if (Array.isArray(exp.plugins)) {
+      exp.plugins = exp.plugins.map((p) =>
+        Array.isArray(p) && p[0] === 'expo-splash-screen' ? [p[0], { ...p[1], backgroundColor: '#fefce8' }] : p)
+    }
     fs.writeFileSync(appJsonPath, JSON.stringify(renamed, null, 2))
     const log2 = path.join(home, 'serve-rename.log')
     const out2 = fs.openSync(log2, 'w')
@@ -209,6 +219,36 @@ async function runFixture(key) {
     } finally {
       try { process.kill(-srv2.pid) } catch {}
       fs.writeFileSync(appJsonPath, appJsonOrig)
+    }
+    await until(async () => !(await get(`http://localhost:${port}/status`).then(() => true).catch(() => false)), 15_000, 500)
+
+    // --- G. REAL config drift must serve stale instantly + rebuild in background ---
+    // Changing global.css genuinely invalidates the family (nativewind input). Boot
+    // must still be instant — serving the newest image — with the fresh build running
+    // BEHIND the server, never in front of it.
+    const cssPath = path.join(dir, 'global.css')
+    const cssOrig = fs.existsSync(cssPath) ? fs.readFileSync(cssPath, 'utf8') : null
+    if (cssOrig != null) {
+      fs.writeFileSync(cssPath, cssOrig + `\n/* drift ${Date.now()} */\n`)
+      const log3 = path.join(home, 'serve-drift.log')
+      const out3 = fs.openSync(log3, 'w')
+      const srv3 = spawn('node', [path.join(REPO, 'bin', 'jetplane.mjs'), 'serve', '--port', String(port)], {
+        cwd: dir, env: { ...process.env, JETPLANE_HOME: home }, stdio: ['ignore', out3, out3], detached: true,
+      })
+      try {
+        const t0 = Date.now()
+        const upS = await until(async () => (await get(`http://localhost:${port}/status`)).ok, 45_000, 1000)
+        const bootS = (Date.now() - t0) / 1000
+        const log3Txt = () => fs.readFileSync(log3, 'utf8')
+        record(key, 'config-drift: serves stale instantly', upS && log3Txt().includes('despite config drift') && bootS < 30,
+          upS ? `${bootS.toFixed(1)}s` : 'server did not come up')
+        const rebuilt = await until(async () => /background rebuild (done|failed)/.test(log3Txt()), 8 * 60_000, 5000)
+        record(key, 'config-drift: background rebuild completes', rebuilt && log3Txt().includes('background rebuild done'),
+          (log3Txt().match(/background rebuild.*$/m) || [''])[0])
+      } finally {
+        try { process.kill(-srv3.pid) } catch {}
+        fs.writeFileSync(cssPath, cssOrig)
+      }
     }
   } finally {
     cleanup()
