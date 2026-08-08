@@ -20,6 +20,11 @@ const projectDir = process.argv[2]
 let port = parseInt(process.argv[3] || '8091', 10)
 const imageDir = process.argv[4] || `${process.env.JETPLANE_HOME || process.env.HOME}/.jetplane/images/expo54`
 
+// Transforms must run exactly as project-local Metro would: babel alias plugins
+// (e.g. "@/..." via module-resolver) resolve against CWD, so a server launched from
+// elsewhere would silently emit wrong relative paths into hot modules.
+try { process.chdir(projectDir) } catch {}
+
 // The address a phone or another host on the network uses to reach us. `ipconfig` is
 // macOS-only, so fall back to the first non-internal IPv4 interface — that's what works
 // on a Linux box, where en0/en1 don't exist.

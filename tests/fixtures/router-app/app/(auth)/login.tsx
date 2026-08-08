@@ -1,4 +1,10 @@
-// Representative AI-generated login screen (public group).
+// Representative AI-generated login screen (public group). The imports below are
+// deliberately the ones that broke production drift-freshening (project alekib6w3w /
+// sxh2zlrxsj): expo-constants pulls a dep chain that imports the 'buffer' builtin
+// (must resolve to the node_modules polyfill), and lucide-react-native is a barrel
+// package whose whole icon subtree enters as new modules.
+import Constants from 'expo-constants';
+import { UserPlusIcon } from 'lucide-react-native';
 import { useState } from 'react';
 import { Pressable, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -14,6 +20,10 @@ export default function LoginScreen() {
       <Text testID="login-title" className="mb-6 text-2xl font-bold text-foreground">
         Sign in
       </Text>
+      <View className="mb-3 flex-row items-center">
+        <UserPlusIcon size={16} />
+        <Text className="ml-2 text-muted-foreground">v{Constants.expoConfig?.version ?? '1.0.0'}</Text>
+      </View>
       <TextInput
         className="mb-3 rounded-lg border border-border px-4 py-3 text-foreground"
         placeholder="Email"

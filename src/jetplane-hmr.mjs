@@ -5,7 +5,7 @@
 // Metro. On an app-file edit we transform just that file (hot), wrap it as a Metro HMR
 // module (id + deps + verboseName + inverseDependenciesById), and push it over /hot.
 
-import { createRequire } from 'node:module'
+import { createRequire, builtinModules } from 'node:module'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -63,6 +63,20 @@ function moduleRegion(src, id) {
 // the project's "@/" root alias — all normal in an Expo app. Approximate Metro's
 // resolution: Node first, then extension/index probing (platform-specific first).
 function resolveSourceFile(req, requesterFile, name, projectDir, platform) {
+  // Node builtins shadow same-named npm polyfills: require.resolve('buffer') returns
+  // the literal string 'buffer' (the builtin), which is NOT a file — but in a React
+  // Native project 'buffer'/'events'/... mean the node_modules polyfill package.
+  const bare = name.replace(/^node:/, '')
+  if (builtinModules.includes(bare)) {
+    try {
+      const pkgPath = req.resolve(`${bare}/package.json`)
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))
+      const entry = path.join(path.dirname(pkgPath), pkg['react-native'] ?? pkg.browser ?? pkg.main ?? 'index.js')
+      if (fs.existsSync(entry) && fs.statSync(entry).isFile()) return entry
+      for (const e of ['.js', '/index.js']) { const p = entry + e; if (fs.existsSync(p)) return p }
+    } catch {}
+    return null // builtin with no installed polyfill — not resolvable to a source file
+  }
   try { return req.resolve(name) } catch {}
   const bases = []
   if (name.startsWith('.')) bases.push(path.resolve(path.dirname(requesterFile), name))
@@ -300,8 +314,18 @@ export async function makeDriftUpdate(projectDir, maps, clientUrlBase, platform 
   if (ctxRel && (addedFiles.length || removedFiles.length)) {
     const ctxId = maps.pathToId.get(ctxRel)
     for (const rel of addedFiles) P.addEdge(freshId(rel), ctxId)
-    for (const rel of addedFiles) await P.process(path.join(projectDir, rel), freshId(rel), rel, true, ctxId)
-    modified.push(regenCtx(P, projectDir, maps, ctxRel, ctxId, appFiles, routerRoot))
+    // One broken file must not blank the whole app: transform each added route
+    // independently, keep the failures OUT of the regenerated ctx (that route 404s
+    // instead of crashing on require), and surface what failed to the server log.
+    const failed = new Set()
+    const failures = []
+    for (const rel of addedFiles) {
+      try { await P.process(path.join(projectDir, rel), freshId(rel), rel, true, ctxId) }
+      catch (e) { failed.add(rel); failures.push(`${rel}: ${e.message}`) }
+    }
+    const ctxFiles = appFiles.filter((r) => !failed.has(r))
+    modified.push(regenCtx(P, projectDir, maps, ctxRel, ctxId, ctxFiles, routerRoot))
+    if (failures.length) console.log(`jetplane: ${failures.length} route file(s) failed to freshen and were left out:\n  ` + failures.join('\n  '))
   }
 
   if (manifest) {
