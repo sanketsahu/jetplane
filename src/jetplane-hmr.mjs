@@ -214,6 +214,18 @@ function createProcessor(projectDir, maps, clientUrlBase, platform) {
     const code = `__d(function (global, require, _i, _a, module, exports, _d) { throw new Error(${JSON.stringify(`Module not found: ${name} (optional dependency unresolved by jetplane)`)}); },${id},[],${JSON.stringify(`missing:${name}`)})`
     added.push({ module: [id, code], sourceURL: urlFor(`missing/${name.replace(/[^\w.-]/g, '_')}.js`) })
   }
+  // Binary assets (pngs etc.) can't go through the source transform — babel would
+  // choke on the bytes. Metro registers them in the asset registry; for freshened
+  // modules a plain {uri} source object is enough (Image accepts it), served by the
+  // thin server's own /assets route.
+  const SOURCE_EXT = /\.(m?[jt]sx?|cjs|json)$/
+  const emitAsset = (id, rel) => {
+    if (visited.has(id)) return
+    visited.add(id)
+    const uri = `${clientUrlBase}/assets/?unstable_path=${encodeURIComponent(rel)}`
+    const code = `__d(function (global, require, _i, _a, module, exports, _d) { module.exports = { uri: ${JSON.stringify(uri)}, __packager_asset: true }; },${id},[],${JSON.stringify(rel)})`
+    added.push({ module: [id, code], sourceURL: urlFor(rel + '.js') })
+  }
   const process = async (file, id, rel, isNew, parentId, sourceOverride) => {
     if (visited.has(id)) return
     visited.add(id)
@@ -222,7 +234,11 @@ function createProcessor(projectDir, maps, clientUrlBase, platform) {
     const factory = r.output[0].data.code
     const newMods = []
     const deps = resolveDeps(maps, file, id, factory, projectDir, newMods, platform)
-    for (const nm of newMods) { if (nm.missing) emitStub(nm.id, nm.missing); else await process(nm.file, nm.id, nm.rel, true, id) }
+    for (const nm of newMods) {
+      if (nm.missing) emitStub(nm.id, nm.missing)
+      else if (!SOURCE_EXT.test(nm.file)) emitAsset(nm.id, nm.rel)
+      else await process(nm.file, nm.id, nm.rel, true, id)
+    }
     let code = addParamsToDefineCall(factory, id, deps, rel, inverseClosure(id, inv))
     code += `\n//# sourceURL=${urlFor(rel)}\n`
     const entry = { module: [id, code], sourceURL: urlFor(rel) }

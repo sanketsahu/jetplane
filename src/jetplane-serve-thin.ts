@@ -139,7 +139,9 @@ async function freshenAtBoot() {
     const m = p === 'web' ? webMaps : targets.get(p)?.maps
     if (!m) continue
     try {
-      const upd = await makeDriftUpdate(projectDir, m, `http://localhost:${port}`, p, bakeManifest)
+      // publicOrigin, not localhost: freshened modules can embed absolute URLs (asset
+      // {uri}s) that the DEVICE must be able to fetch (EXPO_DEV_SERVER_ORIGIN wins).
+      const upd = await makeDriftUpdate(projectDir, m, publicOrigin(), p, bakeManifest)
       if (!upd) continue
       patchTargetBundle(p, upd)
       console.log(`jetplane[${p}]: freshened stale image (+${upd.added.length} new module(s), ${upd.modified.length} redefined)`)
