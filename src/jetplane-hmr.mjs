@@ -62,6 +62,21 @@ function moduleRegion(src, id) {
 // Node's require.resolve can't see TypeScript sources, directory index.ts files, or
 // the project's "@/" root alias — all normal in an Expo app. Approximate Metro's
 // resolution: Node first, then extension/index probing (platform-specific first).
+// Metro on web tries <file>.web.<ext> before <file>.<ext>. Given any resolved path,
+// return the platform-preferred existing variant (or the path itself if it exists).
+function webVariant(p) {
+  const m = p.match(/^(.*)\.([cm]?jsx?|tsx?)$/)
+  if (m) {
+    const w = `${m[1]}.web.${m[2]}`
+    if (fs.existsSync(w)) return w
+  }
+  try { if (fs.statSync(p).isFile()) return p } catch {}
+  for (const e of ['.web.js', '.js', '/index.web.js', '/index.js']) {
+    if (fs.existsSync(p + e)) return p + e
+  }
+  return null
+}
+
 function resolveSourceFile(req, requesterFile, name, projectDir, platform) {
   // On web, react-native means react-native-web — Metro aliases it at resolution
   // time. Resolving the real package pulls native-only internals into the web
@@ -71,6 +86,22 @@ function resolveSourceFile(req, requesterFile, name, projectDir, platform) {
   if (platform === 'web') {
     if (name === 'react-native') { try { return req.resolve('react-native-web') } catch { return null } }
     if (name.startsWith('react-native/')) return null
+    // Bare packages must enter through their WEB entry (browser field), not "main" —
+    // the native entry pulls native-only internals that expo forbids on web.
+    if (!name.startsWith('.') && !name.startsWith('/') && !name.startsWith('@/')) {
+      try {
+        const pkgName = name.startsWith('@') ? name.split('/').slice(0, 2).join('/') : name.split('/')[0]
+        if (pkgName === name) {
+          const pkgPath = req.resolve(`${pkgName}/package.json`)
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))
+          const entry = typeof pkg.browser === 'string' ? pkg.browser : pkg.main
+          if (entry) {
+            const p = webVariant(path.join(path.dirname(pkgPath), entry))
+            if (p) return p
+          }
+        }
+      } catch {}
+    }
   }
   // Node builtins shadow same-named npm polyfills: require.resolve('buffer') returns
   // the literal string 'buffer' (the builtin), which is NOT a file — but in a React
@@ -86,7 +117,10 @@ function resolveSourceFile(req, requesterFile, name, projectDir, platform) {
     } catch {}
     return null // builtin with no installed polyfill — not resolvable to a source file
   }
-  try { return req.resolve(name) } catch {}
+  try {
+    const f = req.resolve(name)
+    return platform === 'web' ? (webVariant(f) ?? f) : f
+  } catch {}
   const bases = []
   if (name.startsWith('.')) bases.push(path.resolve(path.dirname(requesterFile), name))
   else if (name.startsWith('@/')) bases.push(path.resolve(projectDir, name.slice(2)))

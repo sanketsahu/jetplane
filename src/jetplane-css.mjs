@@ -35,6 +35,47 @@ export function isNativeWindProject(projectDir) {
   try { req.resolve('nativewind/dist/metro/tailwind/v3/child.js'); return !!cssInputPath(projectDir) } catch { return false }
 }
 
+// Persistent tailwind watcher (nativewind's own child, watch mode): emits compiled
+// CSS on start and again ~1-2s after any content change — vs 30-120s for a cold
+// fork per refresh. The caller owns restarts (child exits are reported via onExit).
+export function startTailwindWatch(projectDir, platform, input, onCss, onExit) {
+  const req = createRequire(projectDir + '/')
+  const child_file = req.resolve('nativewind/dist/metro/tailwind/v3/child.js')
+  const child = fork(child_file, {
+    cwd: projectDir,
+    stdio: 'pipe',
+    env: {
+      ...process.env,
+      NATIVEWIND_INPUT: input,
+      NATIVEWIND_OS: platform,
+      NATIVEWIND_WATCH: 'true',
+      BROWSERSLIST: 'last 1 version',
+      BROWSERSLIST_ENV: platform === 'web' ? undefined : 'native',
+    },
+  })
+  child.on('message', (msg) => onCss(String(msg)))
+  child.on('exit', (code) => onExit?.(code))
+  child.on('error', () => onExit?.(-1))
+  return { kill: () => { try { child.kill() } catch {} } }
+}
+
+// Convert tailwind CSS text to the native injectData module source (see
+// generateCssModuleSource for the pipeline background).
+export function nativeCssModuleSource(projectDir, css) {
+  const req = createRequire(projectDir + '/')
+  const { cssToReactNativeRuntime } = req('react-native-css-interop/dist/css-to-rn')
+  let common = {}
+  try { common = req('nativewind/dist/metro/common').cssToReactNativeRuntimeOptions } catch {}
+  let selectorPrefix
+  try {
+    const important = req('tailwindcss/loadConfig')(path.join(projectDir, 'tailwind.config.js')).important
+    if (typeof important === 'string') selectorPrefix = important
+  } catch {}
+  const data = cssToReactNativeRuntime(css, { ...common, inlineRem: 14, selectorPrefix })
+  const source = `import { injectData } from "react-native-css-interop/dist/runtime/native/styles";injectData(${JSON.stringify(data, round3)});`
+  return { source, hash: crypto.createHash('sha256').update(source).digest('hex') }
+}
+
 // One-shot tailwind run (the same child nativewind forks, without watch): resolves
 // with the compiled CSS for the platform. cwd matters — the tailwind content globs
 // are relative to the project.
