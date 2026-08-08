@@ -54,7 +54,8 @@ function tailwindCss(projectDir, platform, input) {
         BROWSERSLIST_ENV: 'native',
       },
     })
-    const t = setTimeout(() => { try { child.kill() } catch {} ; reject(new Error('tailwind timed out (60s)')) }, 60_000)
+    // 120s: a cold fork + tailwind scan inside a 4-CPU gVisor workload can exceed 60s
+    const t = setTimeout(() => { try { child.kill() } catch {} ; reject(new Error('tailwind timed out (120s)')) }, 120_000)
     let done = false
     child.on('message', (msg) => { if (!done) { done = true; clearTimeout(t); resolve(String(msg)); try { child.kill() } catch {} } })
     child.on('error', (e) => { clearTimeout(t); reject(e) })

@@ -137,7 +137,16 @@ function resolveDeps(maps, requesterFile, requesterId, hotCode, projectDir, newM
       if (gid != null) return gid
     }
     const file = resolveSourceFile(req, requesterFile, name, projectDir, platform)
-    if (!file) throw new Error(`cannot resolve "${name}" from ${requesterFile}`)
+    // Unresolvable deps get a Metro-style missing-module STUB instead of aborting the
+    // whole route: Metro marks try/catch'd requires as optional and tolerates their
+    // resolution failures (react-native's dev-tools internals are the classic case —
+    // `if (__DEV__) require('./setUpReactDevTools')` chains into private paths that
+    // don't resolve on disk). The stub throws only if something actually calls it.
+    if (!file) {
+      const sid = freshId(`missing:${name}`)
+      if (!newMods.some((m) => m.id === sid)) newMods.push({ id: sid, rel: `missing:${name}`, missing: name })
+      return sid
+    }
     const rel = path.relative(projectDir, file).split(path.sep).join('/')
     if (maps.pathToId.has(rel)) return maps.pathToId.get(rel)
     const nid = freshId(rel)
@@ -199,6 +208,12 @@ function createProcessor(projectDir, maps, clientUrlBase, platform) {
   const added = []
   const visited = new Set()
   // transform a module, resolve its deps (collecting new ones), recurse, emit entry
+  const emitStub = (id, name) => {
+    if (visited.has(id)) return
+    visited.add(id)
+    const code = `__d(function (global, require, _i, _a, module, exports, _d) { throw new Error(${JSON.stringify(`Module not found: ${name} (optional dependency unresolved by jetplane)`)}); },${id},[],${JSON.stringify(`missing:${name}`)})`
+    added.push({ module: [id, code], sourceURL: urlFor(`missing/${name.replace(/[^\w.-]/g, '_')}.js`) })
+  }
   const process = async (file, id, rel, isNew, parentId, sourceOverride) => {
     if (visited.has(id)) return
     visited.add(id)
@@ -207,7 +222,7 @@ function createProcessor(projectDir, maps, clientUrlBase, platform) {
     const factory = r.output[0].data.code
     const newMods = []
     const deps = resolveDeps(maps, file, id, factory, projectDir, newMods, platform)
-    for (const nm of newMods) await process(nm.file, nm.id, nm.rel, true, id)
+    for (const nm of newMods) { if (nm.missing) emitStub(nm.id, nm.missing); else await process(nm.file, nm.id, nm.rel, true, id) }
     let code = addParamsToDefineCall(factory, id, deps, rel, inverseClosure(id, inv))
     code += `\n//# sourceURL=${urlFor(rel)}\n`
     const entry = { module: [id, code], sourceURL: urlFor(rel) }
