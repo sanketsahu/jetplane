@@ -63,6 +63,15 @@ function moduleRegion(src, id) {
 // the project's "@/" root alias — all normal in an Expo app. Approximate Metro's
 // resolution: Node first, then extension/index probing (platform-specific first).
 function resolveSourceFile(req, requesterFile, name, projectDir, platform) {
+  // On web, react-native means react-native-web — Metro aliases it at resolution
+  // time. Resolving the real package pulls native-only internals into the web
+  // bundle, which throws at runtime ("importing a module from 'react-native'
+  // instead of 'react-native-web'"). Deep react-native/* imports have no web
+  // equivalent here — let them fall through to a missing-stub.
+  if (platform === 'web') {
+    if (name === 'react-native') { try { return req.resolve('react-native-web') } catch { return null } }
+    if (name.startsWith('react-native/')) return null
+  }
   // Node builtins shadow same-named npm polyfills: require.resolve('buffer') returns
   // the literal string 'buffer' (the builtin), which is NOT a file — but in a React
   // Native project 'buffer'/'events'/... mean the node_modules polyfill package.
@@ -179,10 +188,26 @@ function freshId(rel) { if (!NEW_IDS.has(rel)) NEW_IDS.set(rel, NEXT_ID++); retu
 // multi-file drift reconciliation (makeDriftUpdate).
 function createProcessor(projectDir, maps, clientUrlBase, platform) {
   const req = createRequire(projectDir + '/')
-  const worker = req('metro-transform-worker')
   const { addParamsToDefineCall } = req('metro-transform-plugins')
-  const { getDefaultConfig } = req('expo/metro-config')
-  const transformerConfig = getDefaultConfig(projectDir).transformer
+  // Use the PROJECT's transformer chain when it's wired (metro.config.js exporting
+  // transformerPath) — that is jetplane's own content-addressed cache wrapping the
+  // real upstream (nativewind etc.). Two wins over calling metro-transform-worker
+  // raw: freshen transforms hit/fill the shared tstore instead of re-transforming
+  // the same package subtrees on every boot (the ~1700-module lucide storm that
+  // starved and killed workloads), and file handling matches Metro exactly.
+  let worker = null
+  let transformerConfig = null
+  try {
+    const cfg = req(path.join(projectDir, 'metro.config.js'))
+    if (cfg?.transformerPath && cfg?.transformer) {
+      worker = req(cfg.transformerPath)
+      transformerConfig = cfg.transformer
+    }
+  } catch {}
+  if (!worker) {
+    worker = req('metro-transform-worker')
+    transformerConfig = req('expo/metro-config').getDefaultConfig(projectDir).transformer
+  }
 
   // MUST match the options the target's bundle was built with (reactCompiler, routerRoot,
   // engine) or the _dependencyMap indices won't line up with the bundle ids. Native uses
