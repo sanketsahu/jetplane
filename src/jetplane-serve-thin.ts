@@ -279,6 +279,49 @@ for (const dir of watchDirs) fs.watch(dir, { recursive: true }, onSourceEvent(di
 // every watched dir). Non-recursive on purpose: node_modules etc. stay out.
 fs.watch(projectDir, { recursive: false }, onSourceEvent(projectDir))
 
+// ── reconciler: watchers are advisory, disk is truth ─────────────────────────
+// gVisor drops inotify events under load (observed in production: 4 files written
+// in a burst, ONE event delivered — two screens never entered the bundle because
+// nothing ever retriggered a scan). Every 20s, diff the router dir against the
+// served maps; any file the bundle doesn't know about gets queued through the same
+// serialized update pass. mtime-tracked so a file that fails to transform isn't
+// re-attempted until it actually changes.
+const reconcileTried = new Map<string, number>()
+function reconcileTick() {
+  if (updating) return
+  const t = targets.get('ios') ?? [...targets.values()][0]
+  if (!t) return
+  const missing: string[] = []
+  const walk = (d: string) => {
+    let ents: fs.Dirent[]
+    try { ents = fs.readdirSync(d, { withFileTypes: true }) } catch { return }
+    for (const e of ents) {
+      if (e.name.startsWith('.')) continue
+      const p = path.join(d, e.name)
+      if (e.isDirectory()) walk(p)
+      else if (/\.[tj]sx?$/.test(e.name) && !e.name.endsWith('.d.ts')) {
+        const rel = path.relative(projectDir, p).split(path.sep).join('/')
+        if (!t.maps.pathToId.has(rel)) missing.push(p)
+      }
+    }
+  }
+  walk(path.join(projectDir, 'app'))
+  let queued = 0
+  for (const p of missing) {
+    let mtime = 0
+    try { mtime = fs.statSync(p).mtimeMs } catch { continue }
+    if (reconcileTried.get(p) === mtime) continue
+    reconcileTried.set(p, mtime)
+    pending.add(p)
+    queued++
+  }
+  if (queued) {
+    console.log(`jetplane: reconciler found ${queued} file(s) the watcher missed — updating`)
+    drainPending()
+  }
+}
+setInterval(reconcileTick, 20_000).unref?.()
+
 // The origin the device/browser must use to reach us. In plain local dev this is the LAN
 // host:port over http. Behind a reverse proxy (e.g. Cloudflare terminating TLS) the public
 // origin differs from what we bind — so we resolve it, highest priority first:
