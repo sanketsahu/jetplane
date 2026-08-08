@@ -326,6 +326,24 @@ async function runDrift(key) {
     const upd = await hmrClient(port, () => fs.writeFileSync(abs, orig + `\n// drift-hmr ${Date.now()}\n`), screen)
     fs.writeFileSync(abs, orig)
     record(key, 'drift: hmr works on post-bake file', !!upd)
+
+    // 5. BURST of new route files against the RUNNING server — how orchd
+    // write-through delivers an AI edit: several files landing ~seconds apart.
+    // Racing update passes used to silently drop some of them (production bug:
+    // 2 of 4 screens missing). Every file must reach the served bundle.
+    const burst = ['app/burst-a.tsx', 'app/burst-b.tsx', 'app/(app)/burst-c.tsx']
+    for (const [i, rel] of burst.entries()) {
+      fs.mkdirSync(path.dirname(path.join(dir, rel)), { recursive: true })
+      fs.writeFileSync(path.join(dir, rel),
+        `import { Text } from 'react-native';\nexport default function B${i}(){ return <Text>BURST ${i}</Text>; }\n`)
+      await sleep(400)
+    }
+    const burstOk = await until(async () => {
+      const b = await (await get(`http://localhost:${port}/node_modules/expo-router/entry.bundle?platform=ios&dev=true`)).text()
+      return burst.every((r) => b.includes(r))
+    }, 120_000, 3000)
+    for (const rel of burst) fs.rmSync(path.join(dir, rel), { force: true })
+    record(key, 'drift: burst of new files all reach served bundle', burstOk)
   } finally {
     kill()
     restore()

@@ -231,6 +231,40 @@ const watchDirs = ['app', 'components', 'src', 'constants', 'hooks'].map((d) => 
 let timer: any = null
 let cssTimer: any = null
 const pending = new Set<string>()
+
+// STRICTLY ONE update pass at a time. Concurrent passes race: each runs a full
+// drift scan against maps the others are about to replace, so with several files
+// arriving close together (exactly how orchd write-through delivers an AI edit
+// burst) some modules silently lose the race and never enter the served bundle.
+// Sequential + coalesced: files that arrive during a pass are drained in the next
+// one, and a single drift scan covers every still-missing file at once.
+let updating = false
+async function drainPending() {
+  if (updating) return
+  updating = true
+  try {
+    while (pending.size) {
+      const files = [...pending]
+      pending.clear()
+      // one NEW file triggers a drift scan that covers all new files — collapse the
+      // batch to (new-files ? 1 drift trigger : 0) + per-file updates for known files
+      let driftDone = false
+      for (const f of files) {
+        const rel = path.relative(projectDir, f).split(path.sep).join('/')
+        const known = [...targets.values()].some((t) => t.maps.pathToId.has(rel))
+        if (!known && driftDone) continue
+        if (!known) driftDone = true
+        await pushUpdate(f)
+      }
+      // new/changed source can introduce tailwind classes the registry has never
+      // compiled — refresh it (no-op when the generated css is unchanged)
+      await refreshCss('source change')
+    }
+  } finally {
+    updating = false
+    if (pending.size) drainPending()
+  }
+}
 const onSourceEvent = (base: string) => (_e: any, file: any) => {
   if (!file) return
   // css edits (global.css, theme layers) change the compiled registry, not a JS module
@@ -238,13 +272,7 @@ const onSourceEvent = (base: string) => (_e: any, file: any) => {
   if (!/\.(tsx?|jsx?)$/.test(String(file))) return
   pending.add(path.join(base, String(file)))
   clearTimeout(timer)
-  timer = setTimeout(() => {
-    const files = [...pending]; pending.clear()
-    files.forEach(pushUpdate)
-    // new/changed source can introduce tailwind classes the registry has never
-    // compiled — refresh it (no-op when the generated css is unchanged)
-    refreshCss('source change')
-  }, 60)
+  timer = setTimeout(drainPending, 60)
 }
 for (const dir of watchDirs) fs.watch(dir, { recursive: true }, onSourceEvent(dir))
 // Root-level source files too (theme.ts and friends live at the project root, outside
