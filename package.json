@@ -1,6 +1,6 @@
 {
   "name": "jetplane",
-  "version": "0.1.15",
+  "version": "0.1.16",
   "description": "Low-footprint Expo/React Native dev servers — a cross-project transform cache and a thin, no-Metro dev server. ~40 MB per environment vs Metro's ~325 MB idle / ~2 GB cold.",
   "type": "module",
   "license": "MIT",
