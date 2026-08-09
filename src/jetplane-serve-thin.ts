@@ -252,6 +252,9 @@ async function refreshCss(reason: string) {
 // persistent watchers (respawn with backoff if they die)
 function startCssWatchers() {
   if (!isNW) return
+  // bake/capture runs set this: a build container needs no live watchers, and
+  // orphaned tailwind children inside docker build burn CPU for nothing
+  if (process.env.JETPLANE_NO_CSS_WATCH === '1') return
   const input = cssInputPath(projectDir)
   if (!input) return
   const spawnWatch = (platform: string, apply: (css: string, r: string) => void, delay = 0) => {
