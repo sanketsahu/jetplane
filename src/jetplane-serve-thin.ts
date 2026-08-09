@@ -168,7 +168,13 @@ const lastCssHash = new Map<string, string>()
 const pendingRestyle = new Map<string, Map<number, any>>()
 function stashRouteEntries(platform: string, entries: any[]) {
   const m = pendingRestyle.get(platform) ?? pendingRestyle.set(platform, new Map()).get(platform)!
-  for (const e of entries) if (/\/app\//.test(e.sourceURL || '')) m.set(e.module[0], e)
+  for (const e of entries) {
+    const u = e.sourceURL || ''
+    // LEAF screens only. Re-pushing the router ctx module or a _layout makes
+    // expo-router re-evaluate the tree — the whole route remounts and scroll
+    // position resets, which reads as "HMR reloaded my screen".
+    if (/\/app\//.test(u) && !/__ctx__|_layout\./.test(u)) m.set(e.module[0], e)
+  }
 }
 function sendUpdate(platform: string, body: { added: any[]; modified: any[] }) {
   rev++
@@ -179,8 +185,10 @@ function sendUpdate(platform: string, body: { added: any[]; modified: any[] }) {
   for (const ws of clients) if ((clientPlatform.get(ws) || 'ios') === platform) { ws.send(start); ws.send(msg); ws.send(done); n++ }
   return n
 }
+let lastNativeCssText = ''
 async function applyNativeCss(css: string, reason: string) {
   const h = crypto.createHash('sha256').update(css).digest('hex')
+  lastNativeCssText = css
   if (lastCssHash.get('native') === h) return
   lastCssHash.set('native', h)
   let compiled
@@ -259,7 +267,7 @@ function startCssWatchers() {
   if (!input) return
   const spawnWatch = (platform: string, apply: (css: string, r: string) => void, delay = 0) => {
     setTimeout(() => {
-      startTailwindWatch(projectDir, platform, input, (css: string) => apply(css, 'tailwind watch'), () => {
+      startTailwindWatch(projectDir, platform, input, async (css: string) => { await apply(css, 'tailwind watch'); cssEmissionN++ }, () => {
         console.log(`css[${platform}]: tailwind watcher exited — respawning in 10s`)
         spawnWatch(platform, apply, 10_000)
       })
@@ -317,6 +325,15 @@ const pending = new Set<string>()
 // Sequential + coalesced: files that arrive during a pass are drained in the next
 // one, and a single drift scan covers every still-missing file at once.
 let updating = false
+let cssEmissionN = 0
+// className tokens in a source file, best-effort (double/single/backtick literals)
+function classTokens(src: string): string[] {
+  const out: string[] = []
+  for (const m of src.matchAll(/className\s*=\s*(?:"([^"]*)"|'([^']*)'|\{\s*[`"']([^`"']*)[`"']\s*\})/g)) {
+    for (const c of (m[1] ?? m[2] ?? m[3] ?? '').split(/\s+/)) if (c) out.push(c)
+  }
+  return out
+}
 async function drainPending() {
   if (updating) return
   updating = true
@@ -324,6 +341,29 @@ async function drainPending() {
     while (pending.size) {
       const files = [...pending]
       pending.clear()
+
+      // STYLES BEFORE COMPONENTS. If this batch uses classes the current registry
+      // has never compiled, pushing the modules now paints them UNSTYLED until the
+      // registry catches up. The tailwind watcher saw the same file change — give
+      // its emission a bounded head start; the leaf-only restyle re-push covers
+      // whatever the deadline misses.
+      if (isNW && lastNativeCssText) {
+        let unknown = false
+        for (const f of files) {
+          if (!/\.(tsx|jsx)$/.test(f)) continue
+          let src = ''
+          try { src = fs.readFileSync(f, 'utf8') } catch { continue }
+          for (const cls of classTokens(src)) {
+            if (!lastNativeCssText.includes(`.${cls}`)) { unknown = true; break }
+          }
+          if (unknown) break
+        }
+        if (unknown) {
+          const before = cssEmissionN
+          const dl = Date.now() + 2500
+          while (Date.now() < dl && cssEmissionN === before) await new Promise((r) => setTimeout(r, 100))
+        }
+      }
       // one NEW file triggers a drift scan that covers all new files — collapse the
       // batch to (new-files ? 1 drift trigger : 0) + per-file updates for known files
       let driftDone = false
