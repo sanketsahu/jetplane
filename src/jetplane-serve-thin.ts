@@ -186,28 +186,47 @@ function sendUpdate(platform: string, body: { added: any[]; modified: any[] }) {
   return n
 }
 let lastNativeCssText = ''
+let lastWebCssText = ''
+// per-PLATFORM hash of the last registry actually pushed/patched — lets a batch
+// fold in a pending registry change exactly once (applyNativeCss and pushBatch
+// share this bookkeeping)
+const pushedCssHash = new Map<string, string>()
+
+// The registry entry for `platform` if its current css hasn't been pushed there yet.
+async function pendingCssEntry(platform: string, m: any) {
+  const isWeb = platform === 'web'
+  const cssText = isWeb ? lastWebCssText : lastNativeCssText
+  if (!cssText) return null
+  const rel = isWeb
+    ? [...m.pathToId.keys()].find((k: string) => k.endsWith('global.css') || k.endsWith('.css'))
+    : cssCacheModuleRel(m, platform)
+  if (!rel) return null
+  const h = crypto.createHash('sha256').update(cssText).digest('hex')
+  if (pushedCssHash.get(platform) === h) return null
+  const source = isWeb ? cssText : nativeCssModuleSource(projectDir, cssText).source
+  const upd = await makeSourceUpdate(projectDir, m, publicOrigin(), platform, rel, source)
+  pushedCssHash.set(platform, h)
+  return upd.modified[0]
+}
+
 async function applyNativeCss(css: string, reason: string) {
   const h = crypto.createHash('sha256').update(css).digest('hex')
   lastNativeCssText = css
   if (lastCssHash.get('native') === h) return
   lastCssHash.set('native', h)
-  let compiled
-  try { compiled = nativeCssModuleSource(projectDir, css) } catch (e: any) { console.log('css[native]: compile failed -', e.message); return }
   for (const p of targets.keys()) {
     const t = targets.get(p)!
-    const rel = cssCacheModuleRel(t.maps, p)
-    if (!rel) continue
     try {
-      const upd = await makeSourceUpdate(projectDir, t.maps, publicOrigin(), p, rel, compiled.source)
-      sendUpdate(p, { added: upd.added, modified: upd.modified })
-      patchTargetBundle(p, upd)
-      // styles landed after the screens — re-push those screens so they re-render
+      const entry = await pendingCssEntry(p, t.maps)
+      if (!entry) continue // this platform already got the batch-folded registry
+      // styles landed after some screens — ship the registry AND those screens in
+      // ONE update so the restyle is a single refresh pass
       const restyle = pendingRestyle.get(p)
-      if (restyle?.size) {
-        sendUpdate(p, { added: [], modified: [...restyle.values()] })
-        restyle.clear()
-      }
-      console.log(`css[${p}]: registry refreshed (${reason}) — ${(compiled.source.length / 1024).toFixed(0)}KB`)
+      const body = { added: [], modified: [entry, ...(restyle ? restyle.values() : [])] }
+      restyle?.clear()
+      sendUpdate(p, body)
+      patchTargetBundle(p, body)
+      console.log(`css[${p}]: registry refreshed (${reason}) — ${(body.modified.length - 1)} screen(s) restyled`)
     } catch (e: any) {
       console.log(`css[${p}]: refresh skipped -`, e.message)
     }
@@ -216,18 +235,17 @@ async function applyNativeCss(css: string, reason: string) {
 async function applyWebCss(css: string, reason: string) {
   if (!hasWeb || !webMaps) return
   const h = crypto.createHash('sha256').update(css).digest('hex')
+  lastWebCssText = css
   if (lastCssHash.get('web') === h) return
   lastCssHash.set('web', h)
-  // the web registry module IS the transformed css input file — re-transform it
-  // through the project chain (expo's web css handling) with the fresh css text
-  const rel = [...webMaps.pathToId.keys()].find((k: string) => k.endsWith('global.css') || k.endsWith('.css'))
-  if (!rel) { console.log('css[web]: no css module in web bundle'); return }
   try {
-    const upd = await makeSourceUpdate(projectDir, webMaps, publicOrigin(), 'web', rel, css)
-    sendUpdate('web', { added: upd.added, modified: upd.modified })
-    patchTargetBundle('web', upd)
+    const entry = await pendingCssEntry('web', webMaps)
+    if (!entry) return
     const restyle = pendingRestyle.get('web')
-    if (restyle?.size) { sendUpdate('web', { added: [], modified: [...restyle.values()] }); restyle.clear() }
+    const body = { added: [], modified: [entry, ...(restyle ? restyle.values() : [])] }
+    restyle?.clear()
+    sendUpdate('web', body)
+    patchTargetBundle('web', body)
     console.log(`css[web]: stylesheet refreshed (${reason}) — ${(css.length / 1024).toFixed(0)}KB`)
   } catch (e: any) {
     console.log('css[web]: refresh skipped -', e.message)
@@ -281,9 +299,13 @@ const clients = new Set<any>()
 const clientPlatform = new Map<any, string>() // ws -> 'ios' | 'android' | 'web'
 const lan = lanIP()
 let rev = 0
-async function pushUpdate(absFile: string) {
-  // Group connected clients by platform — web and native have different module ids, so
-  // each group gets an update built against its own bundle maps + transform options.
+// ONE ATOMIC UPDATE PER BATCH per platform: css registry + router ctx + added
+// modules + edited screens travel in a single /hot message, applied by the client
+// in one refresh pass. Separate sequential pushes (modules, then css, then a
+// restyle) open visible inconsistency windows — screens paint unstyled until the
+// registry lands, and a ctx-triggered navigator remount races later screen pushes
+// into "Couldn't find a navigation context".
+async function pushBatch(files: string[]) {
   const groups = new Map<string, any[]>()
   for (const ws of clients) {
     const p = clientPlatform.get(ws) || 'ios'
@@ -297,19 +319,35 @@ async function pushUpdate(absFile: string) {
     const m = platform === 'web' ? webMaps : targets.get(platform)?.maps
     if (!m) continue
     const wss = groups.get(platform) || []
-    try {
-      const { modified, added } = await makeUpdate(projectDir, absFile, m, publicOrigin(), platform)
-      rev++
-      const start = JSON.stringify({ type: 'update-start', body: { isInitialUpdate: false } })
-      const upd = JSON.stringify({ type: 'update', body: { revisionId: String(rev), added, modified, deleted: [] } })
-      const done = JSON.stringify({ type: 'update-done' })
-      for (const ws of wss) { ws.send(start); ws.send(upd); ws.send(done) }
-      patchTargetBundle(platform, { modified, added })
-      stashRouteEntries(platform, [...modified, ...added])
-      console.log(`hmr[${platform}]: pushed ${path.relative(projectDir, absFile)} (${modified.length} modified, +${added.length} new) to ${wss.length} client(s)`)
-    } catch (e: any) {
-      console.log(`hmr[${platform}]: skip`, path.relative(projectDir, absFile), '-', e.message)
+    const modified = new Map<number, any>()
+    const added = new Map<number, any>()
+    let driftDone = false
+    let pushedFiles = 0
+    for (const f of files) {
+      const rel = path.relative(projectDir, f).split(path.sep).join('/')
+      const known = m.pathToId.has(rel)
+      if (!known && driftDone) continue // one drift scan already covered all new files
+      if (!known) driftDone = true
+      try {
+        const upd = await makeUpdate(projectDir, f, m, publicOrigin(), platform)
+        for (const e of upd.added) added.set(e.module[0], e)
+        for (const e of upd.modified) modified.set(e.module[0], e)
+        pushedFiles++
+      } catch (e: any) {
+        console.log(`hmr[${platform}]: skip`, path.relative(projectDir, f), '-', e.message)
+      }
     }
+    if (!modified.size && !added.size) continue
+    // fold a pending registry change into the SAME update (styles + components together)
+    try {
+      const cssEntry = await pendingCssEntry(platform, m)
+      if (cssEntry) modified.set(cssEntry.module[0], cssEntry)
+    } catch {}
+    const body = { added: [...added.values()], modified: [...modified.values()] }
+    sendUpdate(platform, body)
+    patchTargetBundle(platform, body)
+    stashRouteEntries(platform, [...body.modified, ...body.added])
+    console.log(`hmr[${platform}]: pushed batch of ${pushedFiles} file(s) (${body.modified.length} modified, +${body.added.length} new) to ${wss.length} client(s)`)
   }
 }
 // debounced recursive watch of the app source
@@ -359,23 +397,15 @@ async function drainPending() {
           if (unknown) break
         }
         if (unknown) {
+          // 12s: on the box (gVisor, shared CPU) a tailwind scan takes several
+          // seconds — a batch with never-seen classes is worth arriving slightly
+          // later but fully styled in ONE update, rather than fast and naked.
           const before = cssEmissionN
-          const dl = Date.now() + 2500
+          const dl = Date.now() + 12_000
           while (Date.now() < dl && cssEmissionN === before) await new Promise((r) => setTimeout(r, 100))
         }
       }
-      // one NEW file triggers a drift scan that covers all new files — collapse the
-      // batch to (new-files ? 1 drift trigger : 0) + per-file updates for known files
-      let driftDone = false
-      for (const f of files) {
-        const rel = path.relative(projectDir, f).split(path.sep).join('/')
-        const known = [...targets.values()].some((t) => t.maps.pathToId.has(rel))
-        if (!known && driftDone) continue
-        if (!known) driftDone = true
-        await pushUpdate(f)
-      }
-      // new tailwind classes are the persistent watch child's job: it sees the same
-      // content change and re-emits css within ~1-2s (applyNativeCss/applyWebCss)
+      await pushBatch(files)
     }
   } finally {
     updating = false
