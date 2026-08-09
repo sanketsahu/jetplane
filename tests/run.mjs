@@ -156,18 +156,37 @@ async function runFixture(key) {
     await sleep(500) // let the restore-write's own push drain before the next case
     record(key, 'hmr: edit existing screen pushes update', !!upd, upd ? `module ${upd.modified?.[0]?.module?.[0]}` : 'no update in 30s')
 
+    // NEW route files change the route SET: the ctx module has no Refresh boundary
+    // above it, so these must arrive as bundle patch + a clean reload command over
+    // /message (stock-Metro semantics), NOT as a /hot update.
+    const reloadListener = (timeoutMs = 60_000) => new Promise((resolve) => {
+      const ws = new WebSocket(`ws://localhost:${port}/message`)
+      const done = (v) => { try { ws.close() } catch {} ; clearTimeout(t); resolve(v) }
+      const t = setTimeout(() => done(false), timeoutMs)
+      ws.onmessage = (ev) => { try { if (JSON.parse(String(ev.data)).method === 'reload') done(true) } catch {} }
+      ws.onerror = () => done(false)
+    })
+    const bundleHas = async (rel) =>
+      (await (await get(`http://localhost:${port}/node_modules/expo-router/entry.bundle?platform=ios&dev=true`)).text()).includes(rel)
+
     const newRoute = path.join(dir, 'app', 'hmr-new-route.tsx')
-    const upd2 = await hmrClient(port, () => fs.writeFileSync(newRoute,
-      "import { Text } from 'react-native';\nexport default function N(){return <Text>NEW</Text>;}\n"), 'app/hmr-new-route.tsx')
-    record(key, 'hmr: new route file appears', !!upd2)
+    const reload1 = reloadListener()
+    fs.writeFileSync(newRoute, "import { Text } from 'react-native';\nexport default function N(){return <Text>NEW</Text>;}\n")
+    const gotReload1 = await reload1
+    const inBundle1 = await until(() => bundleHas('app/hmr-new-route.tsx'), 30_000, 2000)
+    record(key, 'hmr: new route file appears', gotReload1 && inBundle1,
+      `${gotReload1 ? 'reload commanded' : 'NO reload'}, ${inBundle1 ? 'in bundle' : 'NOT in bundle'}`)
 
     const newLayout = path.join(dir, 'app', 'hmr-group')
     fs.mkdirSync(newLayout, { recursive: true })
-    const upd3 = await hmrClient(port, () => fs.writeFileSync(path.join(newLayout, '_layout.tsx'),
-      "import { Slot } from 'expo-router';\nexport default function L(){return <Slot/>;}\n"), 'app/hmr-group/_layout.tsx')
-    record(key, 'hmr: new layout file applies', !!upd3)
+    const reload2 = reloadListener()
+    fs.writeFileSync(path.join(newLayout, '_layout.tsx'),
+      "import { Slot } from 'expo-router';\nexport default function L(){return <Slot/>;}\n")
+    const gotReload2 = await reload2
+    const inBundle2 = await until(() => bundleHas('app/hmr-group/_layout.tsx'), 30_000, 2000)
+    record(key, 'hmr: new layout file applies', gotReload2 && inBundle2)
     fs.rmSync(newRoute, { force: true }); fs.rmSync(newLayout, { recursive: true, force: true })
-    await sleep(500)
+    await sleep(1500) // let the deletions' own route-set change settle
 
     // edit-existing must still work after the new-file noise
     const upd4 = await hmrClient(port, () => fs.writeFileSync(screenAbs, orig + `\n// hmr2 ${Date.now()}\n`), screen)

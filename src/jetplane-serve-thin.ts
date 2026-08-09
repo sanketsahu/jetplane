@@ -297,6 +297,17 @@ function startCssWatchers() {
 
 const clients = new Set<any>()
 const clientPlatform = new Map<any, string>() // ws -> 'ios' | 'android' | 'web'
+// /message sockets: the packager command channel every RN/Expo client listens on —
+// {"method":"reload"} here is exactly what the CLI's `r` key sends
+const messageClients = new Set<any>()
+function commandReload(why: string) {
+  // version 2 is REQUIRED: native RCTPackagerConnection rejects messages without it
+  // ("received message with not supported version (null)")
+  const msg = JSON.stringify({ version: 2, method: 'reload' })
+  let n = 0
+  for (const ws of messageClients) { try { ws.send(msg); n++ } catch {} }
+  console.log(`jetplane: commanded reload (${why}) to ${n} client(s)`)
+}
 const lan = lanIP()
 let rev = 0
 // ONE ATOMIC UPDATE PER BATCH per platform: css registry + router ctx + added
@@ -314,6 +325,7 @@ async function pushBatch(files: string[]) {
   // Every present platform gets processed even with no client connected: the update
   // also PATCHES the served bundle, so a reload (or a device that connects later)
   // sees the edit / the new route file.
+  let routeSetChanged = false
   const plats: string[] = [...targets.keys(), ...(hasWeb ? ['web'] : [])]
   for (const platform of plats) {
     const m = platform === 'web' ? webMaps : targets.get(platform)?.maps
@@ -344,11 +356,24 @@ async function pushBatch(files: string[]) {
       if (cssEntry) modified.set(cssEntry.module[0], cssEntry)
     } catch {}
     const body = { added: [...added.values()], modified: [...modified.values()] }
-    sendUpdate(platform, body)
     patchTargetBundle(platform, body)
+    // A route-SET change (regenerated ctx) cannot go through the HMR walk: the ctx
+    // module has no Refresh boundary above it, so metro-runtime escalates to
+    // performFullRefresh mid-update — a broken remount ("Couldn't find a navigation
+    // context", lost scroll, swallowed edits). Stock Metro reloads for new route
+    // files too — do the same, but CLEANLY: bundle is already patched, command a
+    // reload over /message and skip the /hot update entirely.
+    const ctxChanged = body.modified.some((e: any) => (e.sourceURL || '').includes('__ctx__'))
+    if (ctxChanged) {
+      routeSetChanged = true
+      console.log(`hmr[${platform}]: route set changed — bundle patched (${body.modified.length} modified, +${body.added.length} new), reload pending`)
+      continue
+    }
+    sendUpdate(platform, body)
     stashRouteEntries(platform, [...body.modified, ...body.added])
     console.log(`hmr[${platform}]: pushed batch of ${pushedFiles} file(s) (${body.modified.length} modified, +${body.added.length} new) to ${wss.length} client(s)`)
   }
+  if (routeSetChanged) commandReload('route set changed')
 }
 // debounced recursive watch of the app source
 const watchDirs = ['app', 'components', 'src', 'constants', 'hooks'].map((d) => path.join(projectDir, d)).filter((d) => fs.existsSync(d))
@@ -602,8 +627,8 @@ const serveOpts = {
     return new Response(rewriteHost(freshen(target.manifestRaw), origin), { headers: { 'content-type': 'application/expo+json', 'x-jetplane-platform': platform, 'cache-control': 'private, max-age=0' } })
   },
   websocket: {
-    open(ws: any) { if (!ws.data?.message) clients.add(ws) },
-    close(ws: any) { clients.delete(ws); clientPlatform.delete(ws) },
+    open(ws: any) { if (ws.data?.message) messageClients.add(ws); else clients.add(ws) },
+    close(ws: any) { clients.delete(ws); clientPlatform.delete(ws); messageClients.delete(ws) },
     message(ws: any, msg: any) {
       let data: any = {}
       try { data = JSON.parse(String(msg)) } catch { return }
